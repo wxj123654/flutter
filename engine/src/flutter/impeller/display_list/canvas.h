@@ -40,6 +40,10 @@
 
 namespace impeller {
 
+namespace testing {
+class RootRenderingTest;
+}  // namespace testing
+
 struct BackdropData {
   size_t backdrop_count = 0;
   bool all_filters_equal = true;
@@ -513,6 +517,8 @@ class Canvas {
       const Paint& paint);
 
   RenderPass& GetCurrentRenderPass() const;
+
+  friend class testing::RootRenderingTest;
 
   Canvas(const Canvas&) = delete;
 

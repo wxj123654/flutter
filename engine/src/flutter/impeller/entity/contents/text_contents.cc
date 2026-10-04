@@ -39,8 +39,6 @@ Point SizeToPoint(Size size) {
 }
 }  // namespace
 
-}  // namespace
-
 using VS = GlyphAtlasPipeline::VertexShader;
 using FS = GlyphAtlasPipeline::FragmentShader;
 

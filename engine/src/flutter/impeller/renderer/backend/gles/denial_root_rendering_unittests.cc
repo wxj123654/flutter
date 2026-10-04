@@ -14,6 +14,7 @@
 
 namespace impeller {
 namespace testing {
+
 namespace {
 
 class RootRenderingWorker : public ReactorGLES::Worker {
@@ -22,6 +23,8 @@ class RootRenderingWorker : public ReactorGLES::Worker {
     return true;
   }
 };
+
+}  // namespace
 
 class RootRenderingTest : public ::testing::Test {
  public:
@@ -101,6 +104,10 @@ class RootRenderingTest : public ::testing::Test {
   std::shared_ptr<RootRenderingWorker> worker_;
   std::shared_ptr<ContextGLES> context_;
   std::unique_ptr<ContentContext> renderer_;
+
+  static const RenderPass& Pass(const Canvas& canvas) {
+    return canvas.GetCurrentRenderPass();
+  }
 };
 
 TEST_F(RootRenderingTest, RoundRectUsesSDFOnSingleSampleNativeOutput) {
@@ -109,7 +116,7 @@ TEST_F(RootRenderingTest, RoundRectUsesSDFOnSingleSampleNativeOutput) {
   canvas.DrawRoundRect(
       RoundRect::MakeRectXY(Rect::MakeXYWH(3, 5, 60, 30), 15, 15),
       Paint{.color = Color::White()});
-  const auto& pass = canvas.GetCurrentRenderPass();
+  const auto& pass = Pass(canvas);
   ASSERT_FALSE(pass.GetCommands().empty());
   const auto& pipeline = pass.GetCommands().back().pipeline->GetDescriptor();
   EXPECT_EQ(pipeline.GetSampleCount(), SampleCount::kCount1);
@@ -126,7 +133,7 @@ TEST_F(RootRenderingTest, ExplicitNonAntialiasedRoundRectKeepsGeometryPath) {
   paint.anti_alias = false;
   canvas.DrawRoundRect(
       RoundRect::MakeRectXY(Rect::MakeXYWH(3, 5, 60, 30), 15, 15), paint);
-  const auto& pass = canvas.GetCurrentRenderPass();
+  const auto& pass = Pass(canvas);
   ASSERT_FALSE(pass.GetCommands().empty());
   const auto fragment =
       pass.GetCommands().back().pipeline->GetDescriptor().GetEntrypointForStage(
@@ -139,7 +146,7 @@ TEST_F(RootRenderingTest, ReadablePersistentRootRetainsLoadAndDirectBackdrop) {
   auto output = MakeOutput(LoadAction::kLoad);
   Canvas canvas(*renderer_, output, false, true,
                 Rect::MakeXYWH(20, 15, 10, 12));
-  const auto& pass = canvas.GetCurrentRenderPass();
+  const auto& pass = Pass(canvas);
   EXPECT_FALSE(canvas.RequiresReadback());
   EXPECT_EQ(pass.GetRenderTarget().GetSampleCount(), SampleCount::kCount1);
   EXPECT_EQ(pass.GetRenderTarget().GetRenderTargetTexture(),
@@ -151,18 +158,19 @@ TEST_F(RootRenderingTest, ReadablePersistentRootRetainsLoadAndDirectBackdrop) {
 
 TEST_F(RootRenderingTest, OnlyBorrowedFramebufferTexturesNeedSamplingFlip) {
   auto output = MakeOutput(LoadAction::kClear);
-  EXPECT_EQ(output.GetRenderTargetTexture()->GetYCoordScale(), -1.0f);
-  const auto desc = output.GetRenderTargetTexture()->GetTextureDescriptor();
-  auto owned = context_->GetResourceAllocator()->CreateTexture(desc);
+  const Texture& borrowed = *output.GetRenderTargetTexture();
+  EXPECT_EQ(borrowed.GetYCoordScale(), -1.0f);
+  const auto desc = borrowed.GetTextureDescriptor();
+  const Context& context = *context_;
+  auto owned = context.GetResourceAllocator()->CreateTexture(desc);
   ASSERT_TRUE(owned);
   EXPECT_EQ(owned->GetYCoordScale(), 1.0f);
   auto handle = context_->GetReactor()->CreateHandle(HandleType::kTexture, 42);
   auto external =
       TextureGLES::WrapTexture(context_->GetReactor(), desc, handle);
   ASSERT_TRUE(external);
-  EXPECT_EQ(external->GetYCoordScale(), 1.0f);
+  EXPECT_EQ(static_cast<const Texture&>(*external).GetYCoordScale(), 1.0f);
 }
 
-}  // namespace
 }  // namespace testing
 }  // namespace impeller

@@ -382,7 +382,6 @@ static void EncodeViewport(const ProcTableGLES& gl,
   // Both the viewport and scissor are specified in framebuffer coordinates.
   // Impeller's framebuffer coordinate system is top left origin, but OpenGL's
   // is bottom left origin, so we convert the coordinates here.
-  ISize target_size = pass_data.color_attachment->GetSize();
 
   // Offscreen FBO passes flip in the vertex shader (the swapchain is
   // left alone); see https://github.com/flutter/flutter/issues/186554.

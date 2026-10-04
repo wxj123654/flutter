@@ -2362,7 +2362,7 @@ void Canvas::SaveLayer(const Paint& paint,
   if (backdrop_filter) {
     local_position = subpass_coverage.GetOrigin() - GetGlobalPassPosition();
     const Matrix material_transform = GetCurrentTransform();
-    Canvas::BackdropFilterProc backdrop_filter_proc =
+    auto backdrop_filter_proc =
         [this, backdrop_filter, material_transform](
             const FilterInput::Ref& input, const Matrix& effect_transform,
             Entity::RenderingMode rendering_mode) {
