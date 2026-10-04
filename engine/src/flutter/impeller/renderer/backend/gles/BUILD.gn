@@ -18,7 +18,6 @@ impeller_component("gles_unittests") {
     "buffer_bindings_gles_unittests.cc",
     "command_buffer_gles_unittests.cc",
     "denial_gpu_audit_gles_unittests.cc",
-    "denial_root_rendering_unittests.cc",
     "device_buffer_gles_unittests.cc",
     "render_pass_gles_unittests.cc",
     "test/capabilities_unittests.cc",
@@ -127,6 +126,7 @@ impeller_component("denial_root_rendering_unittests") {
   sources = [
     "denial_root_rendering_unittests.cc",
     "test/mock_gles.cc",
+    "test/mock_gles.h",
   ]
   deps = [
     ":gles",
