@@ -16,6 +16,70 @@ bool SizeDifferenceUnderThreshold(Size a, Size b, Scalar threshold) {
 static constexpr Scalar kDefaultSizeThreshold = 0.3;
 }  // namespace
 
+bool CanRenderBackdropLayerDirectly(
+    const BackdropLayerDirectPlanInputs& inputs) {
+  return GetBackdropLayerDirectRejections(inputs) == 0u;
+}
+
+uint32_t GetBackdropLayerDirectRejections(
+    const BackdropLayerDirectPlanInputs& inputs) {
+  uint32_t result = 0u;
+  const auto reject = [&](bool condition, BackdropLayerDirectRejection reason) {
+    if (condition) {
+      result |= static_cast<uint32_t>(reason);
+    }
+  };
+  reject(!inputs.has_backdrop_filter,
+         BackdropLayerDirectRejection::kMissingBackdropFilter);
+  reject(!inputs.content_is_single_sample_compatible,
+         BackdropLayerDirectRejection::kContentNeedsMultisampling);
+  reject(!inputs.content_bounds_are_contained,
+         BackdropLayerDirectRejection::kContentBoundsUncontained);
+  reject(!inputs.is_root_pass, BackdropLayerDirectRejection::kNestedPass);
+  reject(inputs.restore_blend_mode != BlendMode::kSrc,
+         BackdropLayerDirectRejection::kRestoreBlendMode);
+  reject(!inputs.restore_is_opaque,
+         BackdropLayerDirectRejection::kRestoreNotOpaque);
+  reject(inputs.restore_has_effects,
+         BackdropLayerDirectRejection::kRestoreHasEffects);
+  reject(inputs.shares_backdrop_input,
+         BackdropLayerDirectRejection::kSharedBackdropInput);
+  reject(!ScalarNearlyEqual(inputs.inherited_opacity, 1.0f),
+         BackdropLayerDirectRejection::kInheritedOpacity);
+  return result;
+}
+
+bool CanRenderBackdropSurfaceComposite(
+    const BackdropSurfaceCompositePlanInputs& inputs) {
+  return GetBackdropSurfaceCompositeRejections(inputs) == 0u;
+}
+
+uint32_t GetBackdropSurfaceCompositeRejections(
+    const BackdropSurfaceCompositePlanInputs& inputs) {
+  uint32_t result = 0u;
+  const auto reject = [&](bool condition,
+                          BackdropSurfaceCompositeRejection reason) {
+    if (condition) {
+      result |= static_cast<uint32_t>(reason);
+    }
+  };
+  reject(!inputs.backend_supports_external_sampler,
+         BackdropSurfaceCompositeRejection::kBackend);
+  reject(!inputs.backdrop_is_texture,
+         BackdropSurfaceCompositeRejection::kBackdropNotTexture);
+  reject(!inputs.surface_is_external_texture,
+         BackdropSurfaceCompositeRejection::kSurfaceNotExternalTexture);
+  reject(!inputs.surface_sampling_is_direct,
+         BackdropSurfaceCompositeRejection::kSurfaceSampling);
+  reject(inputs.surface_blend_mode != BlendMode::kSrcOver,
+         BackdropSurfaceCompositeRejection::kSurfaceBlendMode);
+  reject(!inputs.transforms_are_translation_scale,
+         BackdropSurfaceCompositeRejection::kTransform);
+  reject(!inputs.surface_covers_backdrop_scope,
+         BackdropSurfaceCompositeRejection::kCoverage);
+  return result;
+}
+
 std::optional<Rect> ComputeSaveLayerCoverage(
     const Rect& content_coverage,
     const Matrix& effect_transform,

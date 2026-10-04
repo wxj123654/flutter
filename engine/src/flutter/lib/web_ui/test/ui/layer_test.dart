@@ -22,6 +22,22 @@ void testMain() {
   group('LayerScene', () {
     setUpUnitTests(withImplicitView: true);
 
+    test('output-relative transform uses fallback size without output traversal', () {
+      final ui.SceneBuilder builder = LayerSceneBuilder();
+      final ui.OutputRelativeTransformEngineLayer layer = builder.pushOutputRelativeTransform(
+        -0.5,
+        0.25,
+        800,
+        600,
+      );
+      builder.pop();
+      final LayerScene scene = builder.build() as LayerScene;
+      final transform = scene.layerTree.rootLayer.debugLayers.single as TransformEngineLayer;
+      expect(identical(transform, layer), isTrue);
+      expect(transform.transform, Matrix4.translationValues(-400, 150, 0));
+      scene.dispose();
+    });
+
     // Regression test for https://github.com/flutter/flutter/issues/63715
     test('TransformLayer prerolls correctly', () async {
       final recorder = ui.PictureRecorder();

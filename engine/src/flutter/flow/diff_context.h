@@ -5,11 +5,16 @@
 #ifndef FLUTTER_FLOW_DIFF_CONTEXT_H_
 #define FLUTTER_FLOW_DIFF_CONTEXT_H_
 
+#include <cstdint>
 #include <functional>
-#include <map>
+#include <memory>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include "display_list/geometry/dl_region.h"
 #include "display_list/utils/dl_matrix_clip_tracker.h"
+#include "flutter/common/backdrop_filter_cache_key.h"
 #include "flutter/flow/paint_region.h"
 #include "flutter/fml/macros.h"
 
@@ -17,34 +22,109 @@ namespace flutter {
 
 class Layer;
 
-// Represents area that needs to be updated in front buffer (frame_damage) and
-// area that is going to be painted to in back buffer (buffer_damage).
+// Represents regions that need to be updated in the front buffer
+// (frame_damage) and painted into the selected back buffer (buffer_damage).
 struct Damage {
-  // This is the damage between current and previous frame;
+  // This is the damage between current and previous frame.
   // If embedder supports partial update, this is the region that needs to be
   // repainted.
   // Corresponds to "surface damage" from EGL_KHR_partial_update.
-  DlIRect frame_damage;
+  DlRegion frame_damage;
 
-  // Reflects actual change to target framebuffer; This is frame_damage +
-  // damage previously acumulated for target framebuffer.
+  // Reflects actual change to target framebuffer. This is frame_damage plus
+  // damage previously accumulated for the selected target framebuffer.
   // All drawing will be clipped to this region. Knowing the affected area
   // upfront may be useful for tile based GPUs.
   // Corresponds to "buffer damage" from EGL_KHR_partial_update.
-  DlIRect buffer_damage;
+  DlRegion buffer_damage;
 };
 
 // Layer Unique Id to PaintRegion
-using PaintRegionMap = std::map<uint64_t, PaintRegion>;
+using PaintRegionMap = std::unordered_map<uint64_t, PaintRegion>;
+
+// Reusable metadata for autonomous frames that redraw an unchanged layer tree.
+// A texture ID may occur in more than one TextureLayer. The list is sorted by
+// ID after collection so autonomous frames can search it without pointer-heavy
+// tree or hash-map traversal.
+struct TexturePaintRegion {
+  int64_t texture_id;
+  PaintRegion paint_region;
+};
+
+using TexturePaintRegionList = std::vector<TexturePaintRegion>;
+
+struct LayerPaintRegion {
+  uint64_t layer_id;
+  PaintRegion paint_region;
+};
+
+using LayerPaintRegionList = std::vector<LayerPaintRegion>;
+
+// Complete metadata needed to preserve one retained texture subtree without
+// walking its descendants. Readback subtrees are intentionally excluded: they
+// must replay backdrop-filter ordering and dependencies during Diff.
+struct RetainedSubtreeDiffMetadata {
+  LayerPaintRegionList layer_paint_regions;
+  TexturePaintRegionList texture_paint_regions;
+};
+
+using RetainedSubtreeDiffMetadataMap =
+    std::unordered_map<uint64_t,
+                       std::shared_ptr<const RetainedSubtreeDiffMetadata>>;
+
+class BackdropFilterCacheState;
+
+// A successful callback guarantees that this exact snapshot remains available
+// to the renderer until the frame has been submitted.
+using BackdropSnapshotPin = std::function<bool(int64_t, const DlRect&)>;
+
+struct ReadbackRegion {
+  DlIRect paint_rect;
+  DlIRect readback_rect;
+  // The filter's actual coverage, before conservative integer damage rounding.
+  DlRect cache_coverage;
+  std::shared_ptr<BackdropFilterCacheState> cache_state;
+};
+
+using ReadbackRegionList = std::vector<ReadbackRegion>;
+
+// Identifies one semantic version of a backdrop. The stable family identifies
+// the filter and its generation advances whenever content below it changes;
+// changes inside the filter's own subtree intentionally keep the token stable.
+class BackdropFilterCacheState {
+ public:
+  BackdropFilterCacheState();
+
+  int64_t token() const {
+    return MakeBackdropFilterCacheKey(family_, generation_);
+  }
+  void Invalidate();
+
+ private:
+  uint32_t family_;
+  uint32_t generation_ = 1u;
+};
+
+// Reusable ordering metadata for autonomous external-texture frames. Only
+// textures painted before a backdrop filter can invalidate its cached input.
+struct BackdropFilterCacheMetadata {
+  std::shared_ptr<BackdropFilterCacheState> state;
+  std::vector<int64_t> input_texture_ids;
+};
+
+using BackdropFilterCacheMetadataList =
+    std::vector<BackdropFilterCacheMetadata>;
 
 // Tracks state during tree diffing process and computes resulting damage
 class DiffContext {
  public:
-  explicit DiffContext(DlISize frame_size,
-                       PaintRegionMap& this_frame_paint_region_map,
-                       const PaintRegionMap& last_frame_paint_region_map,
-                       bool has_raster_cache,
-                       bool impeller_enabled);
+  explicit DiffContext(
+      DlISize frame_size,
+      PaintRegionMap& this_frame_paint_region_map,
+      const PaintRegionMap& last_frame_paint_region_map,
+      bool has_raster_cache,
+      bool impeller_enabled,
+      const std::unordered_set<int64_t>* dirty_texture_ids = nullptr);
 
   // Starts a new subtree.
   void BeginSubtree();
@@ -87,6 +167,15 @@ class DiffContext {
   // Returns current transform as DlMatrix.
   const DlMatrix& GetMatrix() const;
 
+  const std::optional<DlSize>& denial_render_output_logical_size() const {
+    return denial_render_output_logical_size_;
+  }
+
+  void set_denial_render_output_logical_size(
+      std::optional<DlSize> logical_size) {
+    denial_render_output_logical_size_ = logical_size;
+  }
+
   // Return cull rect for current subtree (in local coordinates).
   DlRect GetCullRect() const;
 
@@ -123,8 +212,18 @@ class DiffContext {
   //              coordinates)
   // readback_rect - rectangle where the filter samples from (in screen
   //                 coordinates)
-  void AddReadbackRegion(const DlIRect& paint_rect,
-                         const DlIRect& readback_rect);
+  void AddReadbackRegion(
+      const DlIRect& paint_rect,
+      const DlIRect& readback_rect,
+      std::shared_ptr<BackdropFilterCacheState> cache_state = nullptr,
+      std::optional<DlRect> cache_coverage = std::nullopt);
+
+  bool BackdropInputIsDirty(const DlIRect& readback_rect) const;
+
+  std::shared_ptr<BackdropFilterCacheState> RegisterBackdropFilterCache(
+      std::optional<int64_t> group_id,
+      std::shared_ptr<BackdropFilterCacheState> state,
+      const DlIRect& readback_rect);
 
   // Returns the paint region for current subtree; Each rect in paint region is
   // in screen coordinates; Once a layer accumulates the paint regions of its
@@ -134,14 +233,17 @@ class DiffContext {
 
   // Computes final damage
   //
-  // additional_damage is the previously accumulated frame_damage for
-  // current framebuffer
+  // additional_damage is the previously accumulated frame damage for the
+  // current framebuffer. nullopt means that the framebuffer contents are
+  // unknown and therefore require a complete repaint. An empty region means
+  // that the framebuffer already represents the current front buffer.
   //
-  // clip_alignment controls the alignment of resulting frame and surface
-  // damage.
-  Damage ComputeDamage(const DlIRect& additional_damage,
+  // clip_alignment controls the alignment of every rectangle in the resulting
+  // frame and buffer damage.
+  Damage ComputeDamage(const std::optional<DlRegion>& additional_damage,
                        int horizontal_clip_alignment = 0,
-                       int vertical_clip_alignment = 0) const;
+                       int vertical_clip_alignment = 0,
+                       const BackdropSnapshotPin& pin_backdrop = {}) const;
 
   // Adds the region to current damage. Used for removed layers, where instead
   // of diffing the layer its paint region is direcly added to damage.
@@ -163,6 +265,50 @@ class DiffContext {
   bool has_raster_cache() const { return has_raster_cache_; }
 
   bool impeller_enabled() const { return impeller_enabled_; }
+
+  // Returns true when normal diffing must conservatively repaint every
+  // texture, or when an autonomous texture frame explicitly marked this ID.
+  bool IsTextureDirty(int64_t texture_id) const {
+    return dirty_texture_ids_ == nullptr ||
+           dirty_texture_ids_->find(texture_id) != dirty_texture_ids_->end();
+  }
+
+  // Captures texture paint regions and readback dependencies while diffing a
+  // new layer tree. The supplied containers are cleared before use.
+  void SetDiffMetadataCache(
+      TexturePaintRegionList* texture_regions,
+      ReadbackRegionList* readback_regions,
+      BackdropFilterCacheMetadataList* backdrop_filter_caches,
+      RetainedSubtreeDiffMetadataMap* retained_subtrees,
+      const RetainedSubtreeDiffMetadataMap* previous_retained_subtrees);
+
+  // Records the paint region for a TextureLayer in the active metadata cache.
+  void CacheTexturePaintRegion(int64_t texture_id,
+                               const PaintRegion& paint_region);
+
+  // Reuses all per-layer and external-texture metadata for an unchanged,
+  // readback-free retained subtree if none of its textures are dirty.
+  bool TryReuseRetainedSubtreeMetadata(const Layer* layer,
+                                       const PaintRegion& paint_region);
+
+  // Captures metadata produced while an otherwise reusable texture subtree is
+  // diffed for the first time. Nested captures are folded into the outer block
+  // to avoid duplicating metadata.
+  class AutoRetainedSubtreeMetadataCapture {
+    FML_DISALLOW_COPY_ASSIGN_AND_MOVE(AutoRetainedSubtreeMetadataCapture);
+
+   public:
+    AutoRetainedSubtreeMetadataCapture(DiffContext* context,
+                                       const Layer* layer);
+    ~AutoRetainedSubtreeMetadataCapture();
+
+   private:
+    DiffContext* context_;
+    bool active_;
+  };
+
+  // Reuses readback dependencies captured for the exact same LayerTree.
+  void UseCachedReadbackRegions(const ReadbackRegionList* readback_regions);
 
   class Statistics {
    public:
@@ -242,33 +388,55 @@ class DiffContext {
   // Rect must be in device coordinates.
   DlRect ApplyFilterBoundsAdjustment(DlRect rect) const;
 
-  DlRect damage_;
+  DlRegion damage_;
 
   PaintRegionMap& this_frame_paint_region_map_;
   const PaintRegionMap& last_frame_paint_region_map_;
   bool has_raster_cache_;
   bool impeller_enabled_;
+  const std::unordered_set<int64_t>* dirty_texture_ids_;
+
+  // Constant for a Denial physical-output traversal. This lives outside the
+  // ordinary subtree state because synthesized source crops set and restore it
+  // around the shared Flutter root.
+  std::optional<DlSize> denial_render_output_logical_size_;
+  TexturePaintRegionList* texture_region_cache_ = nullptr;
+  ReadbackRegionList* readback_region_cache_ = nullptr;
+  BackdropFilterCacheMetadataList* backdrop_filter_cache_ = nullptr;
+  RetainedSubtreeDiffMetadataMap* retained_subtree_cache_ = nullptr;
+  const RetainedSubtreeDiffMetadataMap* previous_retained_subtree_cache_ =
+      nullptr;
+  const ReadbackRegionList* cached_readback_regions_ = nullptr;
+  std::unordered_map<int64_t, std::shared_ptr<BackdropFilterCacheState>>
+      backdrop_group_states_;
 
   void AddDamage(const DlRect& rect);
 
-  void AlignRect(DlIRect& rect,
-                 int horizontal_alignment,
-                 int vertical_clip_alignment) const;
+  DlIRect AlignRect(const DlIRect& rect,
+                    int horizontal_alignment,
+                    int vertical_clip_alignment) const;
+  DlRegion AlignRegion(const DlRegion& region,
+                       int horizontal_alignment,
+                       int vertical_clip_alignment) const;
 
-  struct Readback {
+  struct Readback : ReadbackRegion {
     // Index of rects_ entry that this readback belongs to. Used to
     // determine if subtree has any readback
     size_t position;
-
-    // Paint region of the filter performing readback, in screen coordinates.
-    DlIRect paint_rect;
-
-    // Readback area of the filter, in screen coordinates.
-    DlIRect readback_rect;
   };
 
   std::vector<Readback> readbacks_;
   Statistics statistics_;
+
+  struct RetainedSubtreeCapture {
+    uint64_t layer_id;
+    LayerPaintRegionList layer_paint_regions;
+    TexturePaintRegionList texture_paint_regions;
+  };
+
+  bool BeginRetainedSubtreeMetadataCapture(const Layer* layer);
+  void EndRetainedSubtreeMetadataCapture();
+  std::optional<RetainedSubtreeCapture> retained_subtree_capture_;
 };
 
 }  // namespace flutter

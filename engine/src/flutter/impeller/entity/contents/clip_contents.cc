@@ -69,7 +69,9 @@ ClipCoverage ClipContents::GetClipCoverage(
 
 bool ClipContents::Render(const ContentContext& renderer,
                           RenderPass& pass,
-                          uint32_t clip_depth) const {
+                          uint32_t clip_depth,
+                          bool is_backdrop_replay,
+                          std::optional<IRect32> cover_scissor) const {
   if (!clip_geometry_.vertex_buffer) {
     return true;
   }
@@ -92,6 +94,7 @@ bool ClipContents::Render(const ContentContext& renderer,
        clip_geometry_.mode == GeometryResult::Mode::kPreventOverdraw) &&
       clip_op_ == Entity::ClipOperation::kDifference) {
     options.depth_write_enabled = true;
+    pass.SetCommandAuditCategory(CommandAuditCategory::kClipDirect);
     pass.SetPipeline(renderer.GetClipPipeline(options));
 
     VS::BindFrameInfo(pass,
@@ -123,6 +126,9 @@ bool ClipContents::Render(const ContentContext& renderer,
           ContentContextOptions::StencilMode::kStencilIncrementAll;
       break;
   }
+  pass.SetCommandAuditCategory(is_backdrop_replay
+                                   ? CommandAuditCategory::kClipReplayStencil
+                                   : CommandAuditCategory::kClipStencil);
   pass.SetPipeline(renderer.GetClipPipeline(options));
 
   VS::BindFrameInfo(pass,
@@ -133,6 +139,15 @@ bool ClipContents::Render(const ContentContext& renderer,
   }
 
   /// Write depth.
+
+  // RenderPass::Draw consumes all pending command state. Canvas clips narrow
+  // the active scissor before entering this method, so explicitly carry that
+  // proven cumulative coverage into the second command. Without this rebind,
+  // every local clip emits a full-target cover quad even though subsequent
+  // content remains bounded by the narrower Canvas scissor.
+  if (cover_scissor.has_value()) {
+    pass.SetScissor(cover_scissor.value());
+  }
 
   options.depth_write_enabled = true;
   options.primitive_type = PrimitiveType::kTriangleStrip;
@@ -154,6 +169,9 @@ bool ClipContents::Render(const ContentContext& renderer,
   pass.SetVertexBuffer(
       CreateVertexBuffer(points, renderer.GetTransientsDataBuffer()));
 
+  pass.SetCommandAuditCategory(is_backdrop_replay
+                                   ? CommandAuditCategory::kClipReplayCover
+                                   : CommandAuditCategory::kClipCover);
   pass.SetPipeline(renderer.GetClipPipeline(options));
 
   info.mvp = pass.GetOrthographicTransform();

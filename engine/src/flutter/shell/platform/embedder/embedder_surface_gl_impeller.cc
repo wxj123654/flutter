@@ -77,10 +77,12 @@ class ReactorWorker final : public impeller::ReactorGLES::Worker {
 EmbedderSurfaceGLImpeller::EmbedderSurfaceGLImpeller(
     EmbedderSurfaceGLSkia::GLDispatchTable gl_dispatch_table,
     bool fbo_reset_after_present,
+    bool fbo_zero_is_no_target,
     std::shared_ptr<EmbedderExternalViewEmbedder> external_view_embedder,
     impeller::Flags impeller_flags)
     : gl_dispatch_table_(std::move(gl_dispatch_table)),
       fbo_reset_after_present_(fbo_reset_after_present),
+      fbo_zero_is_no_target_(fbo_zero_is_no_target),
       external_view_embedder_(std::move(external_view_embedder)),
       worker_(std::make_shared<ReactorWorker>()) {
   // Make sure all required members of the dispatch table are checked.
@@ -190,7 +192,6 @@ EmbedderSurfaceGLImpeller::GetGLProcResolver() const {
 // |GPUSurfaceGLDelegate|
 SurfaceFrame::FramebufferInfo
 EmbedderSurfaceGLImpeller::GLContextFramebufferInfo() const {
-  // Enable partial repaint by default on the embedders.
   auto info = SurfaceFrame::FramebufferInfo{};
   info.supports_readback = true;
   info.supports_partial_repaint =
@@ -206,9 +207,10 @@ std::unique_ptr<Surface> EmbedderSurfaceGLImpeller::CreateGPUSurface() {
   GLContextMakeCurrent();
 
   return std::make_unique<GPUSurfaceGLImpeller>(
-      this,                     // GPU surface GL delegate
-      impeller_context_,        // Impeller context
-      !external_view_embedder_  // render to surface
+      this,                      // GPU surface GL delegate
+      impeller_context_,         // Impeller context
+      !external_view_embedder_,  // render to surface
+      fbo_zero_is_no_target_     // Denial atlas backpressure contract
   );
 }
 
@@ -228,6 +230,20 @@ sk_sp<GrDirectContext> EmbedderSurfaceGLImpeller::CreateResourceContext()
     worker_->SetReactionsAllowedOnCurrentThread(false);
   }
   return nullptr;
+}
+
+// |EmbedderSurface|
+void EmbedderSurfaceGLImpeller::ReleaseResourceContext() const {
+  // Shell drains image decoding before reaching this IO-thread hook, and has
+  // already released the rasterizer and IO manager. Shut the context down while
+  // the embedder resource context is still current so every shared GL object is
+  // deleted before the context is detached.
+  if (impeller_context_) {
+    static_cast<impeller::Context&>(*impeller_context_).Shutdown();
+  }
+  impeller_context_.reset();
+  worker_->SetReactionsAllowedOnCurrentThread(false);
+  gl_dispatch_table_.gl_clear_current_callback();
 }
 
 }  // namespace flutter

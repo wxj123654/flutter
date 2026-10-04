@@ -4,6 +4,10 @@
 
 #include "impeller/display_list/canvas.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -15,7 +19,10 @@
 #include "display_list/effects/dl_color_filter.h"
 #include "display_list/effects/dl_color_source.h"
 #include "display_list/effects/dl_image_filter.h"
+#include "display_list/effects/image_filters/dl_blur_image_filter.h"
+#include "display_list/effects/image_filters/dl_glass_image_filter.h"
 #include "display_list/image/dl_image.h"
+#include "flutter/fml/closure.h"
 #include "flutter/fml/logging.h"
 #include "flutter/fml/trace_event.h"
 #include "flutter/impeller/geometry/round_superellipse_param.h"
@@ -33,6 +40,7 @@
 #include "impeller/entity/contents/complex_rse_contents.h"
 #include "impeller/entity/contents/content_context.h"
 #include "impeller/entity/contents/filters/filter_contents.h"
+#include "impeller/entity/contents/filters/glass_filter_contents.h"
 #include "impeller/entity/contents/framebuffer_blend_contents.h"
 #include "impeller/entity/contents/line_contents.h"
 #include "impeller/entity/contents/shadow_vertices_contents.h"
@@ -73,6 +81,344 @@ namespace {
 
 constexpr Scalar kAntialiasPadding = 1.0f;
 
+bool IsDirectGlassMaterialRequested() {
+  static const bool requested = [] {
+    const char* value = std::getenv("DENIA_GLASS_DIRECT_MATERIAL");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return requested;
+}
+
+bool IsPooledGlassTargetPaddingRequested() {
+  static const bool requested = [] {
+    const char* value = std::getenv("DENIA_GLASS_POOLED_TARGET_PADDING");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return requested;
+}
+
+bool IsPooledGlassMaterialPaddingRequested() {
+  static const bool requested = [] {
+    const char* value = std::getenv("DENIA_GLASS_POOLED_MATERIAL_PADDING");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return requested;
+}
+
+struct BackdropLayerPlanAudit {
+  using Clock = std::chrono::steady_clock;
+
+  Clock::time_point period_start = Clock::now();
+  uint64_t direct_layers = 0;
+  uint64_t single_sample_layers = 0;
+  uint64_t multisample_layers = 0;
+  uint64_t direct_pixels = 0;
+  uint64_t single_sample_pixels = 0;
+  uint64_t multisample_pixels = 0;
+  uint64_t direct_attempts = 0;
+  uint64_t direct_predicate_accepts = 0;
+  uint64_t direct_filter_evaluations = 0;
+  uint64_t direct_snapshot_builds = 0;
+  uint64_t direct_snapshot_hits = 0;
+  uint64_t fused_candidates = 0;
+  uint64_t fusion_attempts = 0;
+  uint64_t fusion_predicate_accepts = 0;
+  uint64_t fused_composites = 0;
+  uint64_t fused_fallbacks = 0;
+  uint64_t deferred_rrect_clips = 0;
+  uint64_t analytic_rrect_clips = 0;
+  uint64_t flushed_rrect_clips = 0;
+  std::array<uint64_t, 7> fusion_rejections = {};
+  std::array<uint64_t, 9> direct_rejections = {};
+  bool first_report_pending = true;
+};
+
+struct BackdropGraphPlanAudit {
+  using Clock = std::chrono::steady_clock;
+
+  Clock::time_point period_start = Clock::now();
+  uint64_t frames = 0;
+  uint64_t scopes = 0;
+  uint64_t epochs = 0;
+  uint64_t dependency_edges = 0;
+  uint64_t write_read_hazards = 0;
+  uint64_t write_write_hazards = 0;
+  uint64_t read_write_hazards = 0;
+  uint64_t scene_barriers = 0;
+  uint64_t parallel_rects_max = 0;
+  uint64_t epoch_snapshot_flips = 0;
+  uint64_t epoch_snapshot_reuses = 0;
+  uint64_t epoch_plan_misses = 0;
+  bool first_report_pending = true;
+};
+
+enum class BackdropEpochExecution {
+  kSnapshotFlip,
+  kSnapshotReuse,
+  kPlanMiss,
+};
+
+enum class BackdropDirectSource {
+  kFilterEvaluation,
+  kSnapshotBuild,
+  kSnapshotHit,
+};
+
+static bool IsDenialRenderAuditEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DENIA_RENDER_AUDIT");
+    return value != nullptr && value[0] != '\0' &&
+           !(value[0] == '0' && value[1] == '\0');
+  }();
+  return enabled;
+}
+
+static BackdropGraphPlanAudit& GetBackdropGraphPlanAudit() {
+  static thread_local BackdropGraphPlanAudit audit;
+  return audit;
+}
+
+static BackdropLayerPlanAudit& GetBackdropLayerPlanAudit() {
+  static thread_local BackdropLayerPlanAudit audit;
+  return audit;
+}
+
+static void RecordBackdropEpochExecution(BackdropEpochExecution execution) {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+  BackdropGraphPlanAudit& audit = GetBackdropGraphPlanAudit();
+  switch (execution) {
+    case BackdropEpochExecution::kSnapshotFlip:
+      audit.epoch_snapshot_flips++;
+      break;
+    case BackdropEpochExecution::kSnapshotReuse:
+      audit.epoch_snapshot_reuses++;
+      break;
+    case BackdropEpochExecution::kPlanMiss:
+      audit.epoch_plan_misses++;
+      break;
+  }
+}
+
+static void RecordBackdropLayerPlan(
+    ISize size,
+    bool use_msaa,
+    std::optional<BackdropDirectSource> direct_source = std::nullopt) {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+
+  BackdropLayerPlanAudit& audit = GetBackdropLayerPlanAudit();
+  const uint64_t pixels = static_cast<uint64_t>(size.Area());
+  if (direct_source.has_value()) {
+    audit.direct_layers++;
+    audit.direct_pixels += pixels;
+    switch (direct_source.value()) {
+      case BackdropDirectSource::kFilterEvaluation:
+        audit.direct_filter_evaluations++;
+        break;
+      case BackdropDirectSource::kSnapshotBuild:
+        audit.direct_snapshot_builds++;
+        break;
+      case BackdropDirectSource::kSnapshotHit:
+        audit.direct_snapshot_hits++;
+        break;
+    }
+  } else if (use_msaa) {
+    audit.multisample_layers++;
+    audit.multisample_pixels += pixels;
+  } else {
+    audit.single_sample_layers++;
+    audit.single_sample_pixels += pixels;
+  }
+}
+
+static void RecordBackdropDirectPredicate(uint32_t rejections) {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+  BackdropLayerPlanAudit& audit = GetBackdropLayerPlanAudit();
+  audit.direct_attempts++;
+  if (rejections == 0u) {
+    audit.direct_predicate_accepts++;
+    return;
+  }
+  for (size_t bit = 0u; bit < audit.direct_rejections.size(); bit++) {
+    if ((rejections & (1u << bit)) != 0u) {
+      audit.direct_rejections[bit]++;
+    }
+  }
+}
+
+enum class BackdropFusionAuditEvent {
+  kCandidate,
+  kComposite,
+  kFallback,
+  kDeferredRRect,
+  kAnalyticRRect,
+  kFlushedRRect,
+};
+
+static void RecordBackdropFusionEvent(BackdropFusionAuditEvent event) {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+  BackdropLayerPlanAudit& audit = GetBackdropLayerPlanAudit();
+  switch (event) {
+    case BackdropFusionAuditEvent::kCandidate:
+      audit.fused_candidates++;
+      break;
+    case BackdropFusionAuditEvent::kComposite:
+      audit.fused_composites++;
+      break;
+    case BackdropFusionAuditEvent::kFallback:
+      audit.fused_fallbacks++;
+      break;
+    case BackdropFusionAuditEvent::kDeferredRRect:
+      audit.deferred_rrect_clips++;
+      break;
+    case BackdropFusionAuditEvent::kAnalyticRRect:
+      audit.analytic_rrect_clips++;
+      break;
+    case BackdropFusionAuditEvent::kFlushedRRect:
+      audit.flushed_rrect_clips++;
+      break;
+  }
+}
+
+static void RecordBackdropFusionPredicate(uint32_t rejections) {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+  BackdropLayerPlanAudit& audit = GetBackdropLayerPlanAudit();
+  audit.fusion_attempts++;
+  if (rejections == 0u) {
+    audit.fusion_predicate_accepts++;
+    return;
+  }
+  for (size_t bit = 0u; bit < audit.fusion_rejections.size(); bit++) {
+    if ((rejections & (1u << bit)) != 0u) {
+      audit.fusion_rejections[bit]++;
+    }
+  }
+}
+
+static void FlushBackdropLayerPlanAudit() {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+
+  BackdropLayerPlanAudit& audit = GetBackdropLayerPlanAudit();
+  const uint64_t layers = audit.direct_layers + audit.single_sample_layers +
+                          audit.multisample_layers;
+  if (layers == 0u) {
+    return;
+  }
+
+  const auto now = BackdropLayerPlanAudit::Clock::now();
+  const auto interval = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - audit.period_start);
+  if (!audit.first_report_pending && interval < std::chrono::seconds(1)) {
+    return;
+  }
+
+  FML_LOG(IMPORTANT)
+      << "Denial backdrop render plan"
+      << " interval_ms=" << interval.count()
+      << " direct_layers=" << audit.direct_layers
+      << " single_sample_layers=" << audit.single_sample_layers
+      << " multisample_layers=" << audit.multisample_layers
+      << " direct_pixels=" << audit.direct_pixels
+      << " single_sample_pixels=" << audit.single_sample_pixels
+      << " multisample_pixels=" << audit.multisample_pixels
+      << " avoided_color_samples="
+      << audit.direct_pixels * 4u + audit.single_sample_pixels * 3u
+      << " direct_attempts=" << audit.direct_attempts
+      << " direct_predicate_accepts=" << audit.direct_predicate_accepts
+      << " direct_filter_evaluations=" << audit.direct_filter_evaluations
+      << " direct_snapshot_builds=" << audit.direct_snapshot_builds
+      << " direct_snapshot_hits=" << audit.direct_snapshot_hits
+      << " fused_candidates=" << audit.fused_candidates
+      << " fusion_attempts=" << audit.fusion_attempts
+      << " fusion_predicate_accepts=" << audit.fusion_predicate_accepts
+      << " fused_composites=" << audit.fused_composites
+      << " fused_fallbacks=" << audit.fused_fallbacks
+      << " deferred_rrect_clips=" << audit.deferred_rrect_clips
+      << " analytic_rrect_clips=" << audit.analytic_rrect_clips
+      << " flushed_rrect_clips=" << audit.flushed_rrect_clips
+      << " fusion_reject_backend=" << audit.fusion_rejections[0]
+      << " fusion_reject_backdrop_texture=" << audit.fusion_rejections[1]
+      << " fusion_reject_external_surface=" << audit.fusion_rejections[2]
+      << " fusion_reject_surface_sampling=" << audit.fusion_rejections[3]
+      << " fusion_reject_surface_blend=" << audit.fusion_rejections[4]
+      << " fusion_reject_transform=" << audit.fusion_rejections[5]
+      << " fusion_reject_coverage=" << audit.fusion_rejections[6]
+      << " reject_missing_backdrop=" << audit.direct_rejections[0]
+      << " reject_content_msaa=" << audit.direct_rejections[1]
+      << " reject_uncontained_bounds=" << audit.direct_rejections[2]
+      << " reject_nested_pass=" << audit.direct_rejections[3]
+      << " reject_restore_blend=" << audit.direct_rejections[4]
+      << " reject_restore_alpha=" << audit.direct_rejections[5]
+      << " reject_restore_effects=" << audit.direct_rejections[6]
+      << " reject_shared_backdrop=" << audit.direct_rejections[7]
+      << " reject_inherited_opacity=" << audit.direct_rejections[8];
+  audit = BackdropLayerPlanAudit{.period_start = now,
+                                 .first_report_pending = false};
+}
+
+static void RecordBackdropGraphPlan(const BackdropEpochPlan& plan) {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+
+  BackdropGraphPlanAudit& audit = GetBackdropGraphPlanAudit();
+  audit.frames++;
+  audit.scopes += plan.epoch_for_scope.size();
+  audit.epochs += plan.scopes_by_epoch.size();
+  audit.dependency_edges += plan.dependency_edges;
+  audit.write_read_hazards += plan.write_read_hazards;
+  audit.write_write_hazards += plan.write_write_hazards;
+  audit.read_write_hazards += plan.read_write_hazards;
+  audit.scene_barriers += plan.scene_barriers;
+  audit.parallel_rects_max =
+      std::max<uint64_t>(audit.parallel_rects_max, plan.GetMaxEpochWidth());
+}
+
+static void FlushBackdropGraphPlanAudit() {
+  if (!IsDenialRenderAuditEnabled()) {
+    return;
+  }
+
+  BackdropGraphPlanAudit& audit = GetBackdropGraphPlanAudit();
+  const auto now = BackdropGraphPlanAudit::Clock::now();
+  const auto interval = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - audit.period_start);
+  if (!audit.first_report_pending && interval < std::chrono::seconds(1)) {
+    return;
+  }
+
+  const double parallel_rects_avg =
+      audit.epochs == 0u ? 0.0
+                         : static_cast<double>(audit.scopes) / audit.epochs;
+  FML_LOG(IMPORTANT) << "Denial backdrop graph plan"
+                     << " interval_ms=" << interval.count()
+                     << " frames=" << audit.frames << " scopes=" << audit.scopes
+                     << " epochs=" << audit.epochs
+                     << " dependency_edges=" << audit.dependency_edges
+                     << " write_read_hazards=" << audit.write_read_hazards
+                     << " write_write_hazards=" << audit.write_write_hazards
+                     << " read_write_hazards=" << audit.read_write_hazards
+                     << " scene_barriers=" << audit.scene_barriers
+                     << " parallel_rects_avg=" << parallel_rects_avg
+                     << " parallel_rects_max=" << audit.parallel_rects_max
+                     << " epoch_snapshot_flips=" << audit.epoch_snapshot_flips
+                     << " epoch_snapshot_reuses=" << audit.epoch_snapshot_reuses
+                     << " epoch_plan_misses=" << audit.epoch_plan_misses;
+  audit = BackdropGraphPlanAudit{.period_start = now,
+                                 .first_report_pending = false};
+}
+
 bool IsPipelineBlendOrMatrixFilter(const flutter::DlColorFilter* filter) {
   return filter->type() == flutter::DlColorFilterType::kMatrix ||
          (filter->type() == flutter::DlColorFilterType::kBlend &&
@@ -93,9 +439,9 @@ static bool UseColorSourceContents(
   return !vertices->HasTextureCoordinates();
 }
 
-static void SetClipScissor(std::optional<Rect> clip_coverage,
-                           RenderPass& pass,
-                           Point global_pass_position) {
+static IRect32 SetClipScissor(std::optional<Rect> clip_coverage,
+                              RenderPass& pass,
+                              Point global_pass_position) {
   // Set the scissor to the clip coverage area. We do this prior to rendering
   // the clip itself and all its contents.
   IRect32 scissor;
@@ -108,6 +454,7 @@ static void SetClipScissor(std::optional<Rect> clip_coverage,
             .value_or(IRect32());
   }
   pass.SetScissor(scissor);
+  return scissor;
 }
 
 static void ApplyFramebufferBlend(Entity& entity) {
@@ -125,11 +472,15 @@ static std::shared_ptr<Contents> CreateContentsForSubpassTarget(
     const ContentContext& renderer,
     const Paint& paint,
     const std::shared_ptr<Texture>& target,
-    const Matrix& effect_transform) {
-  auto contents = TextureContents::MakeRect(Rect::MakeSize(target->GetSize()));
+    const Matrix& effect_transform,
+    std::string_view label,
+    const std::optional<ISize>& texture_region) {
+  const Rect region =
+      Rect::MakeSize(texture_region.value_or(target->GetSize()));
+  auto contents = TextureContents::MakeRect(region);
   contents->SetTexture(target);
-  contents->SetLabel("Subpass");
-  contents->SetSourceRect(Rect::MakeSize(target->GetSize()));
+  contents->SetLabel(label);
+  contents->SetSourceRect(region);
   contents->SetOpacity(paint.color.alpha);
   contents->SetDeferApplyingOpacity(true);
 
@@ -144,10 +495,20 @@ static const constexpr RenderTarget::AttachmentConfig kDefaultStencilConfig =
         .store_action = StoreAction::kDontCare,
     };
 
+static const constexpr RenderTarget::AttachmentConfig kPersistentStencilConfig =
+    RenderTarget::AttachmentConfig{
+        .storage_mode = StorageMode::kDevicePrivate,
+        .load_action = LoadAction::kDontCare,
+        .store_action = StoreAction::kDontCare,
+    };
+
 static std::unique_ptr<EntityPassTarget> CreateRenderTarget(
     ContentContext& renderer,
     ISize size,
-    const Color& clear_color) {
+    const Color& clear_color,
+    bool use_msaa,
+    bool preserve_depth_stencil_between_passes = false,
+    bool pooled_glass_layer = false) {
   const std::shared_ptr<Context>& context = renderer.GetContext();
 
   /// All of the load/store actions are managed by `InlinePassContext` when
@@ -156,12 +517,16 @@ static std::unique_ptr<EntityPassTarget> CreateRenderTarget(
   /// changed for the lifetime of the textures.
 
   RenderTarget target;
-  if (context->GetCapabilities()->SupportsOffscreenMSAA()) {
+  const RenderTarget::AttachmentConfig stencil_config =
+      preserve_depth_stencil_between_passes ? kPersistentStencilConfig
+                                            : kDefaultStencilConfig;
+  if (use_msaa && context->GetCapabilities()->SupportsOffscreenMSAA()) {
     target = renderer.GetRenderTargetCache()->CreateOffscreenMSAA(
         /*context=*/*context,
         /*size=*/size,
         /*mip_count=*/1,
-        /*label=*/"EntityPass",
+        /*label=*/
+        pooled_glass_layer ? "Denial pooled glass layer" : "EntityPass",
         /*color_attachment_config=*/
         RenderTarget::AttachmentConfigMSAA{
             .storage_mode = StorageMode::kDeviceTransient,
@@ -169,7 +534,7 @@ static std::unique_ptr<EntityPassTarget> CreateRenderTarget(
             .load_action = LoadAction::kDontCare,
             .store_action = StoreAction::kMultisampleResolve,
             .clear_color = clear_color},
-        /*stencil_attachment_config=*/kDefaultStencilConfig);
+        /*stencil_attachment_config=*/stencil_config);
   } else {
     target = renderer.GetRenderTargetCache()->CreateOffscreen(
         *context,  // context
@@ -181,8 +546,8 @@ static std::unique_ptr<EntityPassTarget> CreateRenderTarget(
             .load_action = LoadAction::kDontCare,
             .store_action = StoreAction::kDontCare,
             .clear_color = clear_color,
-        },                     // color_attachment_config
-        kDefaultStencilConfig  //
+        },              // color_attachment_config
+        stencil_config  //
     );
   }
 
@@ -1289,9 +1654,11 @@ void Canvas::DrawCircle(const Point& center,
   }
 }
 
-void Canvas::ClipGeometry(const Geometry& geometry,
-                          Entity::ClipOperation clip_op,
-                          bool is_aa) {
+void Canvas::ClipGeometry(
+    const Geometry& geometry,
+    Entity::ClipOperation clip_op,
+    bool is_aa,
+    std::optional<BackdropSurfaceContents::AnalyticRRect> analytic_round_rect) {
   if (IsSkipping()) {
     return;
   }
@@ -1334,9 +1701,10 @@ void Canvas::ClipGeometry(const Geometry& geometry,
           /*clip_height_floor=*/GetClipHeightFloor(),        //
           /*is_aa=*/is_aa);
 
+  std::optional<IRect32> clip_scissor;
   if (clip_state_result.clip_did_change) {
     // We only need to update the pass scissor if the clip state has changed.
-    SetClipScissor(
+    clip_scissor = SetClipScissor(
         clip_coverage_stack_.CurrentClipCoverage(),
         *render_passes_.back().GetInlinePassContext()->GetRenderPass(),
         GetGlobalPassPosition());
@@ -1347,6 +1715,26 @@ void Canvas::ClipGeometry(const Geometry& geometry,
 
   if (!clip_state_result.should_render) {
     return;
+  }
+
+  const bool can_defer_round_rect =
+      analytic_round_rect.has_value() &&
+      clip_op == Entity::ClipOperation::kIntersect && is_aa &&
+      render_passes_.size() == 1u && clip_transform.IsTranslationScaleOnly() &&
+      FindPendingBackdropComposite() != nullptr &&
+      FindDeferredRRectClip() == nullptr &&
+      renderer_.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES;
+
+  // Scissor-only clips remain logical and can participate in fusion. A clip
+  // that emits GPU work must follow the pending backdrop, so materialize the
+  // exact fallback state before constructing this command.
+  if (!can_defer_round_rect) {
+    if (FindPendingBackdropComposite() != nullptr) {
+      FlushPendingBackdropComposite();
+    } else {
+      FlushDeferredRRectClip();
+    }
   }
 
   // Note: this is a bit of a hack. Its not possible to construct a geometry
@@ -1366,9 +1754,29 @@ void Canvas::ClipGeometry(const Geometry& geometry,
   clip_coverage_stack_.GetLastReplayResult().clip_contents.SetGeometry(
       geometry_result);
 
+  if (can_defer_round_rect) {
+    const Matrix basis = clip_transform.Basis();
+    const Size radii = analytic_round_rect->radii;
+    const Size transformed_radii(
+        (basis * Vector2(radii.width, 0.0f)).GetLength(),
+        (basis * Vector2(0.0f, radii.height)).GetLength());
+    transform_stack_.back().deferred_rrect_clip =
+        std::make_shared<DeferredRRectClip>(DeferredRRectClip{
+            .contents = std::move(clip_contents),
+            .clip_depth = clip_depth,
+            .cover_scissor = clip_scissor,
+            .analytic_clip = {.bounds =
+                                  analytic_round_rect->bounds.TransformBounds(
+                                      clip_transform),
+                              .radii = transformed_radii},
+        });
+    RecordBackdropFusionEvent(BackdropFusionAuditEvent::kDeferredRRect);
+    return;
+  }
+
   clip_contents.Render(
       renderer_, *render_passes_.back().GetInlinePassContext()->GetRenderPass(),
-      clip_depth);
+      clip_depth, /*is_backdrop_replay=*/false, clip_scissor);
 }
 
 void Canvas::DrawPoints(const Point points[],
@@ -1408,7 +1816,8 @@ void Canvas::DrawImageRect(const std::shared_ptr<Texture>& image,
                            Rect dest,
                            const Paint& paint,
                            const SamplerDescriptor& sampler,
-                           SourceRectConstraint src_rect_constraint) {
+                           SourceRectConstraint src_rect_constraint,
+                           bool is_external_texture) {
   if (!image || source.IsEmpty() || dest.IsEmpty()) {
     return;
   }
@@ -1440,6 +1849,7 @@ void Canvas::DrawImageRect(const std::shared_ptr<Texture>& image,
 
   auto texture_contents = TextureContents::MakeRect(dest);
   texture_contents->SetTexture(image);
+  texture_contents->SetIsExternalTexture(is_external_texture);
   texture_contents->SetSourceRect(*clipped_source);
   texture_contents->SetStrictSourceRect(src_rect_constraint ==
                                         SourceRectConstraint::kStrict);
@@ -1452,9 +1862,15 @@ void Canvas::DrawImageRect(const std::shared_ptr<Texture>& image,
   entity.SetTransform(GetCurrentTransform());
 
   if (!paint.mask_blur_descriptor.has_value()) {
-    entity.SetContents(
-        paint.WithFilters(renderer_, std::move(texture_contents)));
-    AddRenderEntityToCurrentPass(entity);
+    std::shared_ptr<TextureContents> texture_candidate = texture_contents;
+    std::shared_ptr<Contents> filtered_contents =
+        paint.WithFilters(renderer_, std::move(texture_contents));
+    const bool is_unwrapped_texture =
+        filtered_contents.get() == texture_candidate.get();
+    entity.SetContents(std::move(filtered_contents));
+    AddRenderEntityToCurrentPass(
+        entity, /*reuse_depth=*/false,
+        is_unwrapped_texture ? std::move(texture_candidate) : nullptr);
     return;
   }
 
@@ -1604,11 +2020,26 @@ void Canvas::SetupRenderPass() {
   renderer_.GetRenderTargetCache()->Start();
   ColorAttachment color0 = render_target_.GetColorAttachment(0);
 
+  // Set up the clear color of the root pass.
+  color0.clear_color = Color::BlackTransparent();
+  render_target_.SetColorAttachment(color0, 0);
+
+  const TextureDescriptor& root_texture =
+      color0.texture->GetTextureDescriptor();
+  const bool preserve_depth_stencil_between_passes = requires_readback_;
+  if (requires_readback_ && (root_texture.usage & TextureUsage::kShaderRead) &&
+      root_texture.sample_count == SampleCount::kCount1) {
+    requires_readback_ = false;
+  }
+
+  const bool root_preserves_depth_stencil =
+      preserve_depth_stencil_between_passes && !requires_readback_;
   auto& stencil_attachment = render_target_.GetStencilAttachment();
   auto& depth_attachment = render_target_.GetDepthAttachment();
-  if (!stencil_attachment.has_value() || !depth_attachment.has_value()) {
-    // Setup a new root stencil with an optimal configuration if one wasn't
-    // provided by the caller.
+  if (root_preserves_depth_stencil || !stencil_attachment.has_value() ||
+      !depth_attachment.has_value()) {
+    // Inter-pass readback needs persistent attachments. All other root targets
+    // retain the cheaper transient depth/stencil allocation.
     render_target_.SetupDepthStencilAttachments(
         *renderer_.GetContext(),
         *renderer_.GetContext()->GetResourceAllocator(),
@@ -1616,12 +2047,10 @@ void Canvas::SetupRenderPass() {
         renderer_.GetContext()->GetCapabilities()->SupportsOffscreenMSAA() &&
             color0.texture->GetTextureDescriptor().sample_count >
                 SampleCount::kCount1,
-        "ImpellerOnscreen", kDefaultStencilConfig);
+        "ImpellerOnscreen",
+        root_preserves_depth_stencil ? kPersistentStencilConfig
+                                     : kDefaultStencilConfig);
   }
-
-  // Set up the clear color of the root pass.
-  color0.clear_color = Color::BlackTransparent();
-  render_target_.SetColorAttachment(color0, 0);
 
   // If requires_readback is true, then there is a backdrop filter or emulated
   // advanced blend in the first save layer. This requires a readback, which
@@ -1632,9 +2061,12 @@ void Canvas::SetupRenderPass() {
     auto entity_pass_target =
         CreateRenderTarget(renderer_,                  //
                            color0.texture->GetSize(),  //
-                           /*clear_color=*/Color::BlackTransparent());
+                           /*clear_color=*/Color::BlackTransparent(),
+                           /*use_msaa=*/true,
+                           /*preserve_depth_stencil_between_passes=*/true);
     render_passes_.push_back(
-        LazyRenderingConfig(renderer_, std::move(entity_pass_target)));
+        LazyRenderingConfig(renderer_, std::move(entity_pass_target),
+                            preserve_depth_stencil_between_passes));
   } else {
     auto entity_pass_target = std::make_unique<EntityPassTarget>(
         render_target_,                                                    //
@@ -1642,7 +2074,8 @@ void Canvas::SetupRenderPass() {
         renderer_.GetDeviceCapabilities().SupportsImplicitResolvingMSAA()  //
     );
     render_passes_.push_back(
-        LazyRenderingConfig(renderer_, std::move(entity_pass_target)));
+        LazyRenderingConfig(renderer_, std::move(entity_pass_target),
+                            preserve_depth_stencil_between_passes));
   }
 }
 
@@ -1713,10 +2146,16 @@ void Canvas::SaveLayer(const Paint& paint,
                        ContentBoundsPromise bounds_promise,
                        uint32_t total_content_depth,
                        bool can_distribute_opacity,
-                       std::optional<int64_t> backdrop_id) {
+                       std::optional<int64_t> backdrop_id,
+                       bool content_is_single_sample_compatible) {
   TRACE_EVENT0("flutter", "Canvas::saveLayer");
   if (IsSkipping()) {
     return SkipUntilMatchingRestore(total_content_depth);
+  }
+  if (FindPendingBackdropComposite() != nullptr) {
+    FlushPendingBackdropComposite();
+  } else {
+    FlushDeferredRRectClip();
   }
 
   auto maybe_coverage_limit = GetLocalCoverageLimit();
@@ -1724,6 +2163,26 @@ void Canvas::SaveLayer(const Paint& paint,
     return SkipUntilMatchingRestore(total_content_depth);
   }
   auto coverage_limit = maybe_coverage_limit.value();
+
+  std::optional<Scalar> backdrop_alpha_threshold;
+  bool backdrop_alpha_threshold_is_single_surface = false;
+  if (backdrop_filter &&
+      (backdrop_filter->type() == flutter::DlImageFilterType::kBlur ||
+       backdrop_filter->type() == flutter::DlImageFilterType::kGlass)) {
+    const Scalar threshold =
+        backdrop_filter->type() == flutter::DlImageFilterType::kBlur
+            ? backdrop_filter->asBlur()->backdrop_alpha_threshold()
+            : backdrop_filter->asGlass()->backdrop_alpha_threshold();
+    if (threshold >= 0.0f) {
+      backdrop_alpha_threshold = std::clamp(threshold, 0.0f, 1.0f);
+      backdrop_alpha_threshold_is_single_surface =
+          backdrop_filter->type() == flutter::DlImageFilterType::kBlur
+              ? backdrop_filter->asBlur()
+                    ->backdrop_alpha_threshold_is_single_surface()
+              : backdrop_filter->asGlass()
+                    ->backdrop_alpha_threshold_is_single_surface();
+    }
+  }
 
   if (can_distribute_opacity && !backdrop_filter &&
       Paint::CanApplyOpacityPeephole(paint) &&
@@ -1790,86 +2249,92 @@ void Canvas::SaveLayer(const Paint& paint,
                                       ->GetCapabilities()
                                       ->GetMaximumRenderPassAttachmentSize());
 
+  // Flutter's retained-layer diff supplies a versioned cache token for every
+  // backdrop filter. Sharing is a separate semantic fact: only multiple uses
+  // of the same token in this DisplayList must observe one common input.
+  bool will_cache_backdrop_texture = false;
+  BackdropData* backdrop_data = nullptr;
+  size_t backdrop_count = 1u;
+  if (backdrop_filter && backdrop_id.has_value()) {
+    auto backdrop_data_it = backdrop_data_.find(backdrop_id.value());
+    if (backdrop_data_it != backdrop_data_.end()) {
+      backdrop_data = &backdrop_data_it->second;
+      will_cache_backdrop_texture = backdrop_data->backdrop_count > 1u;
+      backdrop_count = backdrop_data->backdrop_count;
+    }
+  }
+
+  // A backdrop layer restored with kSrc is an assignment, not an opacity
+  // group. When its child program contains no geometric draws, the exact same
+  // expression can be evaluated in the parent target:
+  //
+  //   layer = backdrop; layer = children over layer; parent = layer (kSrc)
+  //
+  // becomes:
+  //
+  //   parent = backdrop (kSrc); parent = children over parent
+  //
+  // This is the first physical plan which treats saveLayer as a compositing
+  // relationship instead of an allocation request. The DisplayList proof is
+  // conservative: geometric content, nested layers, vertices, atlases,
+  // shadows, and nested DisplayLists all reject the plan. Paint attributes on
+  // the restore and semantically grouped backdrops retain the materialized
+  // path. A single-use cache identity does not change the expression.
+  const bool restore_has_effects =
+      paint.color_source != nullptr || paint.color_filter != nullptr ||
+      paint.image_filter != nullptr || paint.invert_colors ||
+      paint.mask_blur_descriptor.has_value();
+  const BackdropLayerDirectPlanInputs direct_plan_inputs = {
+      .has_backdrop_filter = backdrop_filter != nullptr,
+      .content_is_single_sample_compatible =
+          content_is_single_sample_compatible,
+      .content_bounds_are_contained =
+          bounds_promise == ContentBoundsPromise::kContainsContents,
+      .is_root_pass = render_passes_.size() == 1u,
+      .restore_blend_mode = paint.blend_mode,
+      .restore_is_opaque = paint.color.IsOpaque(),
+      .restore_has_effects = restore_has_effects,
+      .shares_backdrop_input = will_cache_backdrop_texture,
+      .inherited_opacity = transform_stack_.back().distributed_opacity,
+  };
+  const uint32_t direct_plan_rejections =
+      GetBackdropLayerDirectRejections(direct_plan_inputs);
+  const bool can_render_backdrop_directly =
+      direct_plan_rejections == 0u &&
+      (!backdrop_alpha_threshold.has_value() ||
+       backdrop_alpha_threshold_is_single_surface);
+  if (backdrop_filter) {
+    RecordBackdropDirectPredicate(direct_plan_rejections);
+  }
+
+  std::optional<uint32_t> planned_backdrop_epoch;
+  if (backdrop_filter && render_passes_.size() == 1u) {
+    planned_backdrop_epoch =
+        ClaimBackdropEpoch(subpass_coverage, *backdrop_filter);
+  }
+  if (!can_render_backdrop_directly || !planned_backdrop_epoch.has_value()) {
+    active_backdrop_epoch_.reset();
+    active_backdrop_epoch_texture_.reset();
+    if (can_render_backdrop_directly) {
+      RecordBackdropEpochExecution(BackdropEpochExecution::kPlanMiss);
+    }
+  }
+
   // Backdrop filter state, ignored if there is no BDF.
   std::shared_ptr<FilterContents> backdrop_filter_contents;
+  std::optional<Snapshot> isolated_backdrop_snapshot;
+  std::optional<Snapshot> direct_scene_snapshot;
+  bool isolated_backdrop_cache_hit = false;
+  bool should_materialize_isolated_snapshot = false;
   Point local_position = Point(0, 0);
-  if (backdrop_filter) {
-    local_position = subpass_coverage.GetOrigin() - GetGlobalPassPosition();
-
-    std::shared_ptr<Texture> input_texture;
-
-    // If the backdrop ID is not nullopt and there is more than one usage
-    // of it in the current scene, cache the backdrop texture and remove it from
-    // the current entity pass flip.
-    bool will_cache_backdrop_texture = false;
-    BackdropData* backdrop_data = nullptr;
-    // If we've reached this point, there is at least one backdrop filter. But
-    // potentially more if there is a backdrop id. We may conditionally set this
-    // to a higher value in the if block below.
-    size_t backdrop_count = 1;
-    if (backdrop_id.has_value()) {
-      std::unordered_map<int64_t, BackdropData>::iterator backdrop_data_it =
-          backdrop_data_.find(backdrop_id.value());
-      if (backdrop_data_it != backdrop_data_.end()) {
-        backdrop_data = &backdrop_data_it->second;
-        will_cache_backdrop_texture =
-            backdrop_data_it->second.backdrop_count > 1;
-        backdrop_count = backdrop_data_it->second.backdrop_count;
-      }
-    }
-
-    if (!will_cache_backdrop_texture || !backdrop_data->texture_slot) {
-      backdrop_count_ -= backdrop_count;
-
-      // The onscreen texture can be flipped to if:
-      // 1. The device supports framebuffer fetch
-      // 2. There are no more backdrop filters
-      // 3. The current render pass is for the onscreen pass.
-      const bool should_use_onscreen =
-          renderer_.GetDeviceCapabilities().SupportsFramebufferFetch() &&
-          backdrop_count_ == 0 && render_passes_.size() == 1u;
-      input_texture = FlipBackdrop(
-          GetGlobalPassPosition(),                                //
-          /*should_remove_texture=*/will_cache_backdrop_texture,  //
-          /*should_use_onscreen=*/should_use_onscreen             //
-      );
-      if (!input_texture) {
-        // Validation failures are logged in FlipBackdrop.
-        return;
-      }
-
-      if (will_cache_backdrop_texture) {
-        backdrop_data->texture_slot = input_texture;
-      }
-    } else {
-      input_texture = backdrop_data->texture_slot;
-    }
-
-    backdrop_filter_contents =
-        WrapInput(renderer_, backdrop_filter,
-                  FilterInput::Make(std::move(input_texture)));
-    backdrop_filter_contents->SetEffectTransform(
-        transform_stack_.back().transform.Basis());
-    backdrop_filter_contents->SetRenderingMode(
-        transform_stack_.back().transform.HasTranslation()
-            ? Entity::RenderingMode::kSubpassPrependSnapshotTransform
-            : Entity::RenderingMode::kSubpassAppendSnapshotTransform);
-
-    if (will_cache_backdrop_texture) {
-      FML_DCHECK(backdrop_data);
-      // If all filters on the shared backdrop layer are equal, process the
-      // layer once.
-      if (backdrop_data->all_filters_equal &&
-          !backdrop_data->shared_filter_snapshot.has_value()) {
-        // TODO(157110): compute minimum input hint.
-        backdrop_data->shared_filter_snapshot =
-            backdrop_filter_contents->RenderToSnapshot(renderer_, {}, {});
-      }
-
-      std::optional<Snapshot> maybe_snapshot =
-          backdrop_data->shared_filter_snapshot;
-      if (maybe_snapshot.has_value()) {
-        const Snapshot& snapshot = maybe_snapshot.value();
+  auto make_backdrop_snapshot_entity =
+      [&](const Snapshot& snapshot, bool is_direct_cache_composite = false) {
+        // Snapshot::transform maps texture pixels into scene coordinates. Crop
+        // both sides of that mapping to the demanded saveLayer coverage instead
+        // of throwing the transform away and treating the texture as a screen
+        // copy. This makes the draw exactly equivalent to placing the snapshot
+        // in a coverage-sized subpass and restoring that subpass into the
+        // parent.
         std::shared_ptr<TextureContents> contents = TextureContents::MakeRect(
             subpass_coverage.Shift(-GetGlobalPassPosition()));
         auto scaled =
@@ -1877,17 +2342,189 @@ void Canvas::SaveLayer(const Paint& paint,
         contents->SetTexture(snapshot.texture);
         contents->SetSourceRect(scaled);
         contents->SetSamplerDescriptor(snapshot.sampler_descriptor);
+        if (is_direct_cache_composite) {
+          contents->SetLabel("Denial backdrop cached composite");
+        }
 
-        // This backdrop entity sets a depth value as it is written to the newly
-        // flipped backdrop and not into a new saveLayer.
         Entity backdrop_entity;
         backdrop_entity.SetContents(std::move(contents));
-        backdrop_entity.SetClipDepth(++current_depth_);
         backdrop_entity.SetBlendMode(paint.blend_mode);
+        return backdrop_entity;
+      };
+  auto render_backdrop_snapshot = [&](const Snapshot& snapshot,
+                                      bool is_direct_cache_composite = false) {
+    Entity backdrop_entity =
+        make_backdrop_snapshot_entity(snapshot, is_direct_cache_composite);
+    backdrop_entity.SetClipDepth(++current_depth_);
+    FlushDeferredRRectClip();
+    backdrop_entity.Render(renderer_, GetCurrentRenderPass());
+  };
+  if (backdrop_filter) {
+    local_position = subpass_coverage.GetOrigin() - GetGlobalPassPosition();
+    const Matrix material_transform = GetCurrentTransform();
+    Canvas::BackdropFilterProc backdrop_filter_proc =
+        [this, backdrop_filter, material_transform](
+            const FilterInput::Ref& input, const Matrix& effect_transform,
+            Entity::RenderingMode rendering_mode) {
+          auto filter = WrapInput(renderer_, backdrop_filter, input);
+          if (backdrop_filter->asGlass()) {
+            std::static_pointer_cast<GlassFilterContents>(filter)
+                ->SetMaterialTransform(material_transform);
+          }
+          filter->SetEffectTransform(effect_transform);
+          filter->SetRenderingMode(rendering_mode);
+          filter->SetIsBackdropFilter(true);
+          return filter;
+        };
 
-        backdrop_entity.Render(renderer_, GetCurrentRenderPass());
-        Save(0);
+    std::shared_ptr<Texture> input_texture;
+
+    // If the backdrop ID is not nullopt and there is more than one usage
+    // of it in the current scene, cache the backdrop texture and remove it from
+    // the current entity pass flip.
+    auto consume_backdrop_count = [&]() {
+      if (!backdrop_data || !backdrop_data->backdrop_count_consumed) {
+        backdrop_count_ -= backdrop_count;
+        if (backdrop_data) {
+          backdrop_data->backdrop_count_consumed = true;
+        }
+      }
+    };
+
+    const bool can_cache_across_frames = backdrop_id.has_value() &&
+                                         backdrop_data &&
+                                         backdrop_data->all_filters_equal;
+    if (can_cache_across_frames) {
+      auto cached = renderer_.GetCachedBackdropSnapshot(backdrop_id.value());
+      const auto cached_coverage =
+          cached.has_value() ? cached->GetCoverage() : std::nullopt;
+      if (cached_coverage.has_value() &&
+          cached_coverage->Contains(subpass_coverage)) {
+        renderer_.RecordBackdropSnapshotReuse(backdrop_id.value());
+        consume_backdrop_count();
+        if (will_cache_backdrop_texture) {
+          backdrop_data->shared_filter_snapshot = cached;
+          render_backdrop_snapshot(cached.value());
+          Save(0);
+          return;
+        }
+        isolated_backdrop_snapshot = std::move(cached);
+        isolated_backdrop_cache_hit = true;
+      }
+    }
+
+    if (!isolated_backdrop_snapshot.has_value() &&
+        !will_cache_backdrop_texture && can_cache_across_frames) {
+      // MSAA child content needs a color layer, but does not make a changing
+      // backdrop worth retaining. Persistent snapshots disable the temporary
+      // render-target pool while filtering. Eagerly materializing every new
+      // generation therefore reallocates the entire filter chain during a
+      // drag. Use the same reuse observation as the direct path; until the
+      // input stabilizes, the ordinary subpass can use pooled filter targets.
+      should_materialize_isolated_snapshot =
+          renderer_.ShouldMaterializeBackdropSnapshot(backdrop_id.value());
+    }
+
+    if (!isolated_backdrop_snapshot.has_value() &&
+        (!will_cache_backdrop_texture || !backdrop_data->texture_slot)) {
+      consume_backdrop_count();
+
+      const bool can_reuse_epoch_snapshot =
+          can_render_backdrop_directly && planned_backdrop_epoch.has_value() &&
+          active_backdrop_epoch_ == planned_backdrop_epoch &&
+          active_backdrop_epoch_texture_;
+      if (can_reuse_epoch_snapshot) {
+        input_texture = active_backdrop_epoch_texture_;
+        RecordBackdropEpochExecution(BackdropEpochExecution::kSnapshotReuse);
+      } else {
+        // The onscreen texture can be flipped to if:
+        // 1. The device supports framebuffer fetch
+        // 2. There are no more backdrop filters
+        // 3. The current render pass is for the onscreen pass.
+        const bool should_use_onscreen =
+            renderer_.GetDeviceCapabilities().SupportsFramebufferFetch() &&
+            backdrop_count_ == 0 && render_passes_.size() == 1u;
+        input_texture = FlipBackdrop(
+            GetGlobalPassPosition(),                                //
+            /*should_remove_texture=*/will_cache_backdrop_texture,  //
+            /*should_use_onscreen=*/should_use_onscreen             //
+        );
+        if (input_texture && can_render_backdrop_directly &&
+            planned_backdrop_epoch.has_value()) {
+          active_backdrop_epoch_ = planned_backdrop_epoch;
+          active_backdrop_epoch_texture_ = input_texture;
+          RecordBackdropEpochExecution(BackdropEpochExecution::kSnapshotFlip);
+        }
+      }
+      if (!input_texture) {
+        // Validation failures are logged in FlipBackdrop.
         return;
+      }
+
+      if (can_render_backdrop_directly) {
+        direct_scene_snapshot = Snapshot{
+            .texture = input_texture,
+            .transform = Matrix(),
+        };
+      }
+
+      if (will_cache_backdrop_texture) {
+        backdrop_data->texture_slot = input_texture;
+      }
+    } else if (!isolated_backdrop_snapshot.has_value()) {
+      input_texture = backdrop_data->texture_slot;
+    }
+
+    if (!isolated_backdrop_snapshot.has_value()) {
+      const Entity::RenderingMode backdrop_rendering_mode =
+          can_render_backdrop_directly && !should_materialize_isolated_snapshot
+              ? Entity::RenderingMode::kDirect
+          : transform_stack_.back().transform.HasTranslation()
+              ? Entity::RenderingMode::kSubpassPrependSnapshotTransform
+              : Entity::RenderingMode::kSubpassAppendSnapshotTransform;
+      backdrop_filter_contents = backdrop_filter_proc(
+          FilterInput::Make(std::move(input_texture)),
+          transform_stack_.back().transform.Basis(), backdrop_rendering_mode);
+
+      auto render_persistent_snapshot = [&]() {
+        // A cross-frame snapshot must own its texture exclusively. Otherwise
+        // Impeller's per-frame render-target pool may recycle and overwrite it.
+        renderer_.GetRenderTargetCache()->DisableCache();
+        fml::ScopedCleanupClosure restore_render_target_cache(
+            [&] { renderer_.GetRenderTargetCache()->EnableCache(); });
+        // An ungrouped filter only needs the pixels covered by its saveLayer.
+        // Supplying that output limit also lets filters crop their input work.
+        // Grouped filters still need one snapshot that can serve every member.
+        const std::optional<Rect> coverage_limit =
+            will_cache_backdrop_texture ? std::nullopt
+                                        : std::make_optional(subpass_coverage);
+        return backdrop_filter_contents->RenderToSnapshot(
+            renderer_, {}, {.coverage_limit = coverage_limit});
+      };
+
+      std::optional<Snapshot> maybe_snapshot;
+      if (will_cache_backdrop_texture) {
+        FML_DCHECK(backdrop_data);
+        if (backdrop_data->all_filters_equal &&
+            !backdrop_data->shared_filter_snapshot.has_value()) {
+          // TODO(157110): compute minimum input hint.
+          backdrop_data->shared_filter_snapshot = render_persistent_snapshot();
+        }
+        maybe_snapshot = backdrop_data->shared_filter_snapshot;
+      } else if (should_materialize_isolated_snapshot) {
+        maybe_snapshot = render_persistent_snapshot();
+      }
+
+      if (maybe_snapshot.has_value()) {
+        if (can_cache_across_frames) {
+          renderer_.CacheBackdropSnapshot(backdrop_id.value(),
+                                          maybe_snapshot.value());
+        }
+        if (will_cache_backdrop_texture) {
+          render_backdrop_snapshot(maybe_snapshot.value());
+          return;
+        }
+        isolated_backdrop_snapshot = std::move(maybe_snapshot);
       }
     }
   }
@@ -1897,14 +2534,189 @@ void Canvas::SaveLayer(const Paint& paint,
   paint_copy.color.alpha *= transform_stack_.back().distributed_opacity;
   transform_stack_.back().distributed_opacity = 1.0;
 
+  if (can_render_backdrop_directly &&
+      (backdrop_filter_contents || isolated_backdrop_snapshot.has_value())) {
+    // The physical subpass used to provide this crop implicitly. A logical
+    // scope must carry the demanded output region explicitly when its filter
+    // is evaluated directly in the parent target.
+    Entity backdrop_entity;
+    std::optional<Entity> resolved_backdrop_entity;
+    std::shared_ptr<TextureContents> resolved_backdrop_contents;
+    if (isolated_backdrop_snapshot.has_value()) {
+      resolved_backdrop_entity =
+          make_backdrop_snapshot_entity(isolated_backdrop_snapshot.value(),
+                                        /*is_direct_cache_composite=*/true);
+      resolved_backdrop_contents = std::static_pointer_cast<TextureContents>(
+          resolved_backdrop_entity->GetContents());
+    } else {
+      backdrop_filter_contents->SetCoverageHint(subpass_coverage);
+      backdrop_entity.SetContents(backdrop_filter_contents);
+      backdrop_entity.SetBlendMode(BlendMode::kSrc);
+      backdrop_entity.SetTransform(
+          Matrix::MakeTranslation(Vector3(-GetGlobalPassPosition())));
+    }
+
+    // Reserve the depth slot consumed by the logical backdrop assignment even
+    // when its final texture draw is deferred and fused with the first proven
+    // external surface. Filter evaluation is resolved now: Gaussian blur
+    // already returns a texture-backed entity, so this does not allocate or
+    // draw another intermediate.
+    const uint32_t backdrop_depth = ++current_depth_;
+    if (!resolved_backdrop_entity.has_value()) {
+      backdrop_entity.SetClipDepth(backdrop_depth);
+      const bool direct_glass_material =
+          IsDirectGlassMaterialRequested() &&
+          backdrop_filter->type() == flutter::DlImageFilterType::kGlass &&
+          !backdrop_alpha_threshold.has_value() &&
+          renderer_.GetContext()->GetBackendType() ==
+              Context::BackendType::kOpenGLES;
+      if (direct_glass_material) {
+        // WrapInput maps a DlGlassImageFilter to GlassFilterContents. Only
+        // this non-threshold, uncached direct path may return a shader entity;
+        // texture fusion and persistent snapshots keep their existing type.
+        resolved_backdrop_entity =
+            std::static_pointer_cast<GlassFilterContents>(
+                backdrop_filter_contents)
+                ->GetDirectEntity(renderer_, backdrop_entity, subpass_coverage);
+      } else {
+        resolved_backdrop_entity = backdrop_filter_contents->GetEntity(
+            renderer_, backdrop_entity, subpass_coverage);
+      }
+      if (!direct_glass_material && resolved_backdrop_entity.has_value() &&
+          (backdrop_filter->type() == flutter::DlImageFilterType::kBlur ||
+           backdrop_filter->type() == flutter::DlImageFilterType::kGlass)) {
+        // GaussianBlurFilterContents resolves its final pass through
+        // Entity::FromSnapshot. The filter discriminator is the explicit type
+        // proof; Flutter's engine deliberately builds without C++ RTTI.
+        resolved_backdrop_contents = std::static_pointer_cast<TextureContents>(
+            resolved_backdrop_entity->GetContents());
+      }
+    }
+    if (resolved_backdrop_entity.has_value()) {
+      resolved_backdrop_entity->SetClipDepth(backdrop_depth);
+    }
+
+    const BackdropDirectSource direct_source =
+        !isolated_backdrop_snapshot.has_value()
+            ? BackdropDirectSource::kFilterEvaluation
+        : isolated_backdrop_cache_hit ? BackdropDirectSource::kSnapshotHit
+                                      : BackdropDirectSource::kSnapshotBuild;
+    RecordBackdropLayerPlan(subpass_size, /*use_msaa=*/false, direct_source);
+
+    // Child operations retain their original depth budget. On GLES, hold a
+    // texture-backed result until the first child draw. A compatible external
+    // texture consumes it through BackdropSurfaceContents; every other child
+    // causes the exact old draw to flush first.
+    Save(total_content_depth);
+    if (resolved_backdrop_entity.has_value() &&
+        resolved_backdrop_contents != nullptr &&
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kOpenGLES) {
+      transform_stack_.back().pending_backdrop_composite =
+          std::make_shared<PendingBackdropComposite>(PendingBackdropComposite{
+              .fallback_entity = std::move(*resolved_backdrop_entity),
+              .backdrop_contents = std::move(resolved_backdrop_contents),
+              .scene_snapshot = std::move(direct_scene_snapshot),
+              .alpha_threshold = backdrop_alpha_threshold,
+              .coverage = subpass_coverage,
+              .scissor = SetClipScissor(
+                  clip_coverage_stack_.CurrentClipCoverage(),
+                  GetCurrentRenderPass(), GetGlobalPassPosition()),
+          });
+      RecordBackdropFusionEvent(BackdropFusionAuditEvent::kCandidate);
+    } else if (resolved_backdrop_entity.has_value()) {
+      FlushDeferredRRectClip();
+      resolved_backdrop_entity->Render(renderer_, GetCurrentRenderPass());
+    }
+    return;
+  }
+
+  const bool use_msaa = !content_is_single_sample_compatible;
+  if (backdrop_filter) {
+    RecordBackdropLayerPlan(subpass_size, use_msaa);
+  }
+
+  std::optional<SaveLayerState::AlphaThresholdBackdrop>
+      alpha_threshold_backdrop;
+  if (backdrop_alpha_threshold.has_value() && !restore_has_effects &&
+      paint.blend_mode == BlendMode::kSrc &&
+      renderer_.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES) {
+    std::optional<Entity> resolved_entity;
+    std::shared_ptr<TextureContents> resolved_contents;
+    if (isolated_backdrop_snapshot.has_value()) {
+      resolved_entity =
+          make_backdrop_snapshot_entity(isolated_backdrop_snapshot.value());
+      resolved_contents = std::static_pointer_cast<TextureContents>(
+          resolved_entity->GetContents());
+    } else if (backdrop_filter_contents) {
+      backdrop_filter_contents->SetCoverageHint(subpass_coverage);
+      Entity backdrop_entity;
+      backdrop_entity.SetContents(backdrop_filter_contents);
+      backdrop_entity.SetBlendMode(BlendMode::kSrc);
+      backdrop_entity.SetTransform(
+          Matrix::MakeTranslation(Vector3(-GetGlobalPassPosition())));
+      resolved_entity = backdrop_filter_contents->GetEntity(
+          renderer_, backdrop_entity, subpass_coverage);
+      if (resolved_entity.has_value()) {
+        resolved_contents = std::static_pointer_cast<TextureContents>(
+            resolved_entity->GetContents());
+      }
+    }
+    if (resolved_entity.has_value() && resolved_contents) {
+      alpha_threshold_backdrop = SaveLayerState::AlphaThresholdBackdrop{
+          .entity = std::move(resolved_entity.value()),
+          .contents = std::move(resolved_contents),
+          .threshold = backdrop_alpha_threshold.value(),
+      };
+    }
+  }
+
+  std::optional<ISize> texture_region;
+  const bool pooled_glass_layer =
+      IsPooledGlassTargetPaddingRequested() && use_msaa && backdrop_filter &&
+      backdrop_filter->type() == flutter::DlImageFilterType::kGlass &&
+      !backdrop_alpha_threshold.has_value() && !paint.image_filter &&
+      !paint.color_filter &&
+      renderer_.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES;
+  if (pooled_glass_layer) {
+    // During motion, clipping changes a color layer's exact allocation size
+    // almost every frame. Pooling a small set of padded sizes avoids retiring
+    // large MSAA attachments at that rate. Coverage, origin, clip state and
+    // restore geometry remain exact; only the backing allocation grows.
+    constexpr int64_t kGranularity = 128;
+    const ISize pooled_size =
+        ISize{((subpass_size.width + kGranularity - 1) / kGranularity) *
+                  kGranularity,
+              ((subpass_size.height + kGranularity - 1) / kGranularity) *
+                  kGranularity}
+            .Min(renderer_.GetContext()
+                     ->GetCapabilities()
+                     ->GetMaximumRenderPassAttachmentSize());
+    if (pooled_size != subpass_size) {
+      texture_region = subpass_size;
+      subpass_size = pooled_size;
+    }
+  }
+
   render_passes_.push_back(
-      LazyRenderingConfig(renderer_,                                    //
-                          CreateRenderTarget(renderer_,                 //
-                                             subpass_size,              //
-                                             Color::BlackTransparent()  //
+      LazyRenderingConfig(renderer_,                                     //
+                          CreateRenderTarget(renderer_,                  //
+                                             subpass_size,               //
+                                             Color::BlackTransparent(),  //
+                                             use_msaa,                   //
+                                             false,                      //
+                                             pooled_glass_layer          //
                                              )));
   save_layer_state_.push_back(SaveLayerState{
-      paint_copy, subpass_coverage.Shift(-coverage_origin_adjustment)});
+      paint_copy, subpass_coverage.Shift(-coverage_origin_adjustment),
+      backdrop_filter != nullptr, std::move(alpha_threshold_backdrop),
+      texture_region});
+
+  render_passes_.back().GetInlinePassContext()->GetRenderPass()->SetLabel(
+      backdrop_filter ? "Denial Backdrop Layer Color"
+                      : "EntityPass Layer Color");
 
   CanvasStackEntry entry;
   entry.transform = transform_stack_.back().transform;
@@ -1924,15 +2736,39 @@ void Canvas::SaveLayer(const Paint& paint,
   // the subpass will affect in the parent pass.
   clip_coverage_stack_.PushSubpass(subpass_coverage, GetClipHeight());
 
-  if (!backdrop_filter_contents) {
+  if (save_layer_state_.back().alpha_threshold_backdrop.has_value()) {
+    return;
+  }
+
+  if (!backdrop_filter_contents && !isolated_backdrop_snapshot.has_value()) {
     return;
   }
 
   // Render the backdrop entity.
   Entity backdrop_entity;
-  backdrop_entity.SetContents(std::move(backdrop_filter_contents));
-  backdrop_entity.SetTransform(
-      Matrix::MakeTranslation(Vector3(-local_position)));
+  if (isolated_backdrop_snapshot.has_value()) {
+    const Snapshot& snapshot = isolated_backdrop_snapshot.value();
+    backdrop_entity = Entity::FromSnapshot(snapshot, BlendMode::kSrcOver);
+    backdrop_entity.SetTransform(
+        Matrix::MakeTranslation(Vector3(-local_position)) *
+        backdrop_entity.GetTransform());
+  } else {
+    if (IsPooledGlassMaterialPaddingRequested() && use_msaa &&
+        backdrop_filter &&
+        backdrop_filter->type() == flutter::DlImageFilterType::kGlass &&
+        !backdrop_alpha_threshold.has_value() && !paint.image_filter &&
+        !paint.color_filter &&
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kOpenGLES) {
+      // This uncached material is consumed immediately by the child layer.
+      // Persistent snapshots and threshold consumers never enter this path.
+      std::static_pointer_cast<GlassFilterContents>(backdrop_filter_contents)
+          ->SetMaterialTargetPaddingEnabled(true);
+    }
+    backdrop_entity.SetContents(std::move(backdrop_filter_contents));
+    backdrop_entity.SetTransform(
+        Matrix::MakeTranslation(Vector3(-local_position)));
+  }
   backdrop_entity.SetClipDepth(std::numeric_limits<uint32_t>::max());
   backdrop_entity.Render(renderer_, GetCurrentRenderPass());
 }
@@ -1941,6 +2777,14 @@ bool Canvas::Restore() {
   FML_DCHECK(transform_stack_.size() > 0);
   if (transform_stack_.size() == 1) {
     return false;
+  }
+
+  // A rounded clip that reached its matching restore without another physical
+  // consumer was either used analytically by a fused composite or guarded no
+  // pixels at all. In both cases its stencil-and-cover fallback is unnecessary.
+  transform_stack_.back().deferred_rrect_clip.reset();
+  if (transform_stack_.back().pending_backdrop_composite) {
+    FlushPendingBackdropComposite();
   }
 
   // This check is important to make sure we didn't exceed the depth
@@ -1974,7 +2818,7 @@ bool Canvas::Restore() {
     // Force the render pass to be constructed if it never was.
     lazy_render_pass.GetInlinePassContext()->GetRenderPass();
 
-    SaveLayerState save_layer_state = save_layer_state_.back();
+    SaveLayerState save_layer_state = std::move(save_layer_state_.back());
     save_layer_state_.pop_back();
     auto global_pass_position = GetGlobalPassPosition();
 
@@ -1982,8 +2826,10 @@ bool Canvas::Restore() {
         renderer_, save_layer_state.paint,                         //
         lazy_render_pass.GetInlinePassContext()->GetTexture(),     //
         Matrix::MakeTranslation(Vector3{-global_pass_position}) *  //
-            transform_stack_.back().transform                      //
-    );
+            transform_stack_.back().transform,                     //
+        save_layer_state.has_backdrop_filter ? "Denial backdrop layer restore"
+                                             : "Subpass",  //
+        save_layer_state.texture_region);
 
     lazy_render_pass.GetInlinePassContext()->EndPass();
 
@@ -2004,6 +2850,35 @@ bool Canvas::Restore() {
       subpass_texture_position =
           (save_layer_state.coverage.GetOrigin() - global_pass_position)
               .Round();
+    }
+
+    if (save_layer_state.alpha_threshold_backdrop.has_value()) {
+      auto alpha_threshold_backdrop =
+          std::move(save_layer_state.alpha_threshold_backdrop.value());
+      auto surface_contents =
+          std::static_pointer_cast<TextureContents>(contents);
+      const Matrix surface_transform =
+          Matrix::MakeTranslation(Vector3(subpass_texture_position));
+      auto composite = BackdropSurfaceContents::Make(
+          alpha_threshold_backdrop.entity, alpha_threshold_backdrop.contents,
+          /*scene_snapshot=*/std::nullopt, surface_contents, surface_transform,
+          save_layer_state.coverage.Shift(-global_pass_position),
+          alpha_threshold_backdrop.threshold,
+          /*analytic_clip=*/std::nullopt,
+          /*require_external_surface=*/false);
+      if (composite) {
+        Entity element_entity;
+        element_entity.SetClipDepth(++current_depth_);
+        element_entity.SetContents(std::move(composite));
+        element_entity.SetBlendMode(BlendMode::kSrcOver);
+        element_entity.SetTransform(surface_transform);
+        element_entity.Render(
+            renderer_,
+            *render_passes_.back().GetInlinePassContext()->GetRenderPass());
+        clip_coverage_stack_.PopSubpass();
+        transform_stack_.pop_back();
+        return true;
+      }
     }
 
     Entity element_entity;
@@ -2303,7 +3178,155 @@ void Canvas::AddRenderEntityWithFiltersToCurrentPass(
   AddRenderEntityToCurrentPass(entity, reuse_depth);
 }
 
-void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
+std::shared_ptr<PendingBackdropComposite>*
+Canvas::FindPendingBackdropComposite() {
+  for (auto entry = transform_stack_.rbegin(); entry != transform_stack_.rend();
+       entry++) {
+    if (entry->pending_backdrop_composite) {
+      return &entry->pending_backdrop_composite;
+    }
+  }
+  return nullptr;
+}
+
+std::shared_ptr<DeferredRRectClip>* Canvas::FindDeferredRRectClip() {
+  for (auto entry = transform_stack_.rbegin(); entry != transform_stack_.rend();
+       entry++) {
+    if (entry->deferred_rrect_clip) {
+      return &entry->deferred_rrect_clip;
+    }
+  }
+  return nullptr;
+}
+
+void Canvas::FlushDeferredRRectClip() {
+  auto* slot = FindDeferredRRectClip();
+  if (slot == nullptr) {
+    return;
+  }
+  std::shared_ptr<DeferredRRectClip> deferred = std::move(*slot);
+  slot->reset();
+  const std::shared_ptr<RenderPass>& pass =
+      render_passes_.back().GetInlinePassContext()->GetRenderPass();
+  if (pass) {
+    deferred->contents.Render(renderer_, *pass, deferred->clip_depth,
+                              /*is_backdrop_replay=*/false,
+                              deferred->cover_scissor);
+    // ClipContents emits two commands and consumes encoder state. Re-establish
+    // the current logical scissor for the draw that forced materialization.
+    SetClipScissor(clip_coverage_stack_.CurrentClipCoverage(), *pass,
+                   GetGlobalPassPosition());
+  }
+  RecordBackdropFusionEvent(BackdropFusionAuditEvent::kFlushedRRect);
+}
+
+void Canvas::FlushPendingBackdropComposite() {
+  auto* slot = FindPendingBackdropComposite();
+  if (slot == nullptr) {
+    return;
+  }
+  std::shared_ptr<PendingBackdropComposite> pending = std::move(*slot);
+  slot->reset();
+  const std::shared_ptr<RenderPass>& pass =
+      render_passes_.back().GetInlinePassContext()->GetRenderPass();
+  if (pass) {
+    pass->SetScissor(pending->scissor);
+    pending->fallback_entity.Render(renderer_, *pass);
+    SetClipScissor(clip_coverage_stack_.CurrentClipCoverage(), *pass,
+                   GetGlobalPassPosition());
+  }
+  // The rounded clip is a child operation, so it follows the backdrop
+  // assignment when this deferred plan falls back.
+  FlushDeferredRRectClip();
+  RecordBackdropFusionEvent(BackdropFusionAuditEvent::kFallback);
+}
+
+bool Canvas::TryBackdropSurfaceComposite(
+    Entity& surface_entity,
+    const std::shared_ptr<TextureContents>& surface) {
+  auto* pending_slot = FindPendingBackdropComposite();
+  if (pending_slot == nullptr) {
+    return false;
+  }
+  const auto surface_coverage = surface_entity.GetCoverage();
+  const Rect& required_coverage = (*pending_slot)->coverage;
+  const bool coverage_matches =
+      surface_coverage.has_value() &&
+      surface_coverage->Expand(1.0f).Contains(required_coverage) &&
+      required_coverage.Expand(1.0f).Contains(surface_coverage.value());
+  const std::shared_ptr<TextureContents>& backdrop =
+      (*pending_slot)->backdrop_contents;
+  const std::shared_ptr<Texture> surface_texture =
+      surface != nullptr ? surface->GetTexture() : nullptr;
+  const bool surface_sampling_is_direct =
+      surface_texture != nullptr && !surface->GetStrictSourceRect() &&
+      Rect::MakeSize(surface_texture->GetSize())
+          .Contains(surface->GetSourceRect()) &&
+      surface->GetSamplerDescriptor().width_address_mode ==
+          SamplerAddressMode::kClampToEdge &&
+      surface->GetSamplerDescriptor().height_address_mode ==
+          SamplerAddressMode::kClampToEdge;
+  const BackdropSurfaceCompositePlanInputs plan_inputs = {
+      .backend_supports_external_sampler =
+          renderer_.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES,
+      .backdrop_is_texture = backdrop != nullptr,
+      .surface_is_external_texture =
+          BackdropSurfaceContents::SupportsSurfaceTexture(surface),
+      .surface_sampling_is_direct = surface_sampling_is_direct,
+      .surface_blend_mode = surface_entity.GetBlendMode(),
+      .transforms_are_translation_scale =
+          surface_entity.GetTransform().IsTranslationScaleOnly() &&
+          (*pending_slot)
+              ->fallback_entity.GetTransform()
+              .IsTranslationScaleOnly(),
+      .surface_covers_backdrop_scope = coverage_matches,
+  };
+  const uint32_t rejections =
+      GetBackdropSurfaceCompositeRejections(plan_inputs);
+  RecordBackdropFusionPredicate(rejections);
+  if (rejections != 0u) {
+    return false;
+  }
+
+  std::optional<BackdropSurfaceContents::AnalyticRRect> analytic_clip;
+  std::shared_ptr<DeferredRRectClip>* deferred_slot = FindDeferredRRectClip();
+  const bool use_analytic_clip = deferred_slot != nullptr &&
+                                 ((*pending_slot)->scene_snapshot.has_value() ||
+                                  (*pending_slot)->alpha_threshold.has_value());
+  if (use_analytic_clip) {
+    analytic_clip = (*deferred_slot)->analytic_clip;
+  }
+  auto fused = BackdropSurfaceContents::Make(
+      (*pending_slot)->fallback_entity, backdrop,
+      (*pending_slot)->scene_snapshot, surface, surface_entity.GetTransform(),
+      required_coverage, (*pending_slot)->alpha_threshold, analytic_clip);
+  if (!fused) {
+    return false;
+  }
+
+  const bool uses_alpha_threshold =
+      (*pending_slot)->alpha_threshold.has_value();
+  pending_slot->reset();
+  surface_entity.SetContents(std::move(fused));
+  surface_entity.SetBlendMode(uses_alpha_threshold ? BlendMode::kSrcOver
+                                                   : BlendMode::kSrc);
+  if (use_analytic_clip) {
+    RecordBackdropFusionEvent(BackdropFusionAuditEvent::kAnalyticRRect);
+  } else if (deferred_slot != nullptr) {
+    // A cached filtered backdrop may outlive its unfiltered scene snapshot.
+    // Preserve exact clip antialiasing by materializing the already-deferred
+    // clip after the logical backdrop has been consumed into the composite.
+    FlushDeferredRRectClip();
+  }
+  RecordBackdropFusionEvent(BackdropFusionAuditEvent::kComposite);
+  return true;
+}
+
+void Canvas::AddRenderEntityToCurrentPass(
+    Entity& entity,
+    bool reuse_depth,
+    std::shared_ptr<TextureContents> texture_contents) {
   if (IsSkipping()) {
     return;
   }
@@ -2312,6 +3335,13 @@ void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
       Matrix::MakeTranslation(Vector3(-GetGlobalPassPosition())) *
       entity.GetTransform());
   entity.SetInheritedOpacity(transform_stack_.back().distributed_opacity);
+  if (!TryBackdropSurfaceComposite(entity, texture_contents)) {
+    if (FindPendingBackdropComposite() != nullptr) {
+      FlushPendingBackdropComposite();
+    } else {
+      FlushDeferredRRectClip();
+    }
+  }
   if (entity.GetBlendMode() == BlendMode::kSrcOver &&
       entity.GetContents()->IsOpaque(entity.GetTransform())) {
     entity.SetBlendMode(BlendMode::kSrc);
@@ -2407,17 +3437,58 @@ RenderPass& Canvas::GetCurrentRenderPass() const {
 
 void Canvas::SetBackdropData(
     std::unordered_map<int64_t, BackdropData> backdrop_data,
-    size_t backdrop_count) {
+    size_t backdrop_count,
+    BackdropEpochPlan backdrop_epoch_plan) {
   backdrop_data_ = std::move(backdrop_data);
   backdrop_count_ = backdrop_count;
+  backdrop_epoch_plan_ = std::move(backdrop_epoch_plan);
+  backdrop_epoch_cursor_.Reset();
+  active_backdrop_epoch_.reset();
+  active_backdrop_epoch_texture_.reset();
+  RecordBackdropGraphPlan(backdrop_epoch_plan_);
+}
+
+std::optional<uint32_t> Canvas::ClaimBackdropEpoch(
+    const Rect& write_region,
+    const flutter::DlImageFilter& backdrop_filter) {
+  Rect read_region = write_region;
+  if (!write_region.IsEmpty()) {
+    flutter::DlIRect input_bounds;
+    if (backdrop_filter.get_input_device_bounds(
+            flutter::DlIRect::RoundOut(write_region), GetCurrentTransform(),
+            input_bounds)) {
+      read_region = Rect::Make(input_bounds);
+      if (initial_cull_rect_.has_value() && !initial_cull_rect_->IsMaximum()) {
+        read_region = read_region.Intersection(initial_cull_rect_.value())
+                          .value_or(Rect());
+      }
+    } else if (initial_cull_rect_.has_value()) {
+      read_region = initial_cull_rect_.value();
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  return backdrop_epoch_cursor_.Claim(backdrop_epoch_plan_, write_region,
+                                      read_region);
 }
 
 std::shared_ptr<Texture> Canvas::FlipBackdrop(Point global_pass_position,
                                               bool should_remove_texture,
                                               bool should_use_onscreen,
                                               bool post_depth_increment) {
+  // Any standalone readback closes the active graph epoch. A direct backdrop
+  // caller may install the returned scene snapshot as the input for a new
+  // epoch after this method returns.
+  active_backdrop_epoch_.reset();
+  active_backdrop_epoch_texture_.reset();
+
   LazyRenderingConfig rendering_config = std::move(render_passes_.back());
   render_passes_.pop_back();
+
+  const ColorAttachment prior_color = rendering_config.GetEntityPassTarget()
+                                          ->GetRenderTarget()
+                                          .GetColorAttachment(0);
 
   // If the very first thing we render in this EntityPass is a subpass that
   // happens to have a backdrop filter or advanced blend, than that backdrop
@@ -2455,6 +3526,10 @@ std::shared_ptr<Texture> Canvas::FlipBackdrop(Point global_pass_position,
     return nullptr;
   }
 
+  const bool clip_state_is_preserved =
+      !should_use_onscreen && rendering_config.GetInlinePassContext()
+                                  ->PreservesDepthStencilBetweenPasses();
+
   if (should_use_onscreen) {
     ColorAttachment color0 = render_target_.GetColorAttachment(0);
     // When MSAA is being used, we end up overriding the entire backdrop by
@@ -2484,44 +3559,55 @@ std::shared_ptr<Texture> Canvas::FlipBackdrop(Point global_pass_position,
   RenderPass& current_render_pass =
       *render_passes_.back().GetInlinePassContext()->GetRenderPass();
 
-  // Eagerly restore the BDF contents.
+  const ColorAttachment current_color = render_passes_.back()
+                                            .GetEntityPassTarget()
+                                            ->GetRenderTarget()
+                                            .GetColorAttachment(0);
+  if (current_color.resolve_texture) {
+    // MSAA attachments cannot load their single-sample resolve texture. Copy
+    // the resolved backdrop into the new attachment instead. Single-sample
+    // targets preserve the same storage with LoadAction::kLoad and need no
+    // restore draw.
+    Rect size_rect = Rect::MakeSize(input_texture->GetSize());
+    auto msaa_backdrop_contents = TextureContents::MakeRect(size_rect);
+    msaa_backdrop_contents->SetStencilEnabled(false);
+    msaa_backdrop_contents->SetLabel("MSAA backdrop");
+    msaa_backdrop_contents->SetSourceRect(size_rect);
+    msaa_backdrop_contents->SetTexture(input_texture);
 
-  // If the pass context returns a backdrop texture, we need to draw it to the
-  // current pass. We do this because it's faster and takes significantly less
-  // memory than storing/loading large MSAA textures. Also, it's not possible
-  // to blit the non-MSAA resolve texture of the previous pass to MSAA
-  // textures (let alone a transient one).
-  Rect size_rect = Rect::MakeSize(input_texture->GetSize());
-  auto msaa_backdrop_contents = TextureContents::MakeRect(size_rect);
-  msaa_backdrop_contents->SetStencilEnabled(false);
-  msaa_backdrop_contents->SetLabel("MSAA backdrop");
-  msaa_backdrop_contents->SetSourceRect(size_rect);
-  msaa_backdrop_contents->SetTexture(input_texture);
-
-  Entity msaa_backdrop_entity;
-  msaa_backdrop_entity.SetContents(std::move(msaa_backdrop_contents));
-  msaa_backdrop_entity.SetBlendMode(BlendMode::kSrc);
-  msaa_backdrop_entity.SetClipDepth(std::numeric_limits<uint32_t>::max());
-  if (!msaa_backdrop_entity.Render(renderer_, current_render_pass)) {
-    VALIDATION_LOG << "Failed to render MSAA backdrop entity.";
-    return nullptr;
+    Entity msaa_backdrop_entity;
+    msaa_backdrop_entity.SetContents(std::move(msaa_backdrop_contents));
+    msaa_backdrop_entity.SetBlendMode(BlendMode::kSrc);
+    msaa_backdrop_entity.SetClipDepth(std::numeric_limits<uint32_t>::max());
+    if (!msaa_backdrop_entity.Render(renderer_, current_render_pass)) {
+      VALIDATION_LOG << "Failed to render MSAA backdrop entity.";
+      return nullptr;
+    }
   }
 
-  // Restore any clips that were recorded before the backdrop filter was
-  // applied.
-  auto& replay_entities = clip_coverage_stack_.GetReplayEntities();
-  uint64_t current_depth =
-      post_depth_increment ? current_depth_ - 1 : current_depth_;
-  for (const auto& replay : replay_entities) {
-    if (replay.clip_depth <= current_depth) {
-      continue;
-    }
+  // A resumed pass over the same target loads its existing depth/stencil
+  // attachments. The scissor is encoder state rather than attachment state,
+  // however, and every new render pass starts without it. Restore the current
+  // scissor even when replaying the stencil clips is unnecessary.
+  if (clip_state_is_preserved) {
+    SetClipScissor(clip_coverage_stack_.CurrentClipCoverage(),
+                   current_render_pass, global_pass_position);
+  } else {
+    auto& replay_entities = clip_coverage_stack_.GetReplayEntities();
+    uint64_t current_depth =
+        post_depth_increment ? current_depth_ - 1 : current_depth_;
+    for (const auto& replay : replay_entities) {
+      if (replay.clip_depth <= current_depth) {
+        continue;
+      }
 
-    SetClipScissor(replay.clip_coverage, current_render_pass,
-                   global_pass_position);
-    if (!replay.clip_contents.Render(renderer_, current_render_pass,
-                                     replay.clip_depth)) {
-      VALIDATION_LOG << "Failed to render entity for clip restore.";
+      const IRect32 clip_scissor = SetClipScissor(
+          replay.clip_coverage, current_render_pass, global_pass_position);
+      if (!replay.clip_contents.Render(
+              renderer_, current_render_pass, replay.clip_depth,
+              /*is_backdrop_replay=*/true, clip_scissor)) {
+        VALIDATION_LOG << "Failed to render entity for clip restore.";
+      }
     }
   }
 
@@ -2609,7 +3695,13 @@ void Canvas::EndReplay() {
   render_passes_.back().GetInlinePassContext()->GetRenderPass();
   render_passes_.back().GetInlinePassContext()->EndPass(
       /*is_onscreen=*/!requires_readback_ && is_onscreen_);
+  FlushBackdropLayerPlanAudit();
+  FlushBackdropGraphPlanAudit();
   backdrop_data_.clear();
+  backdrop_epoch_plan_ = {};
+  backdrop_epoch_cursor_.Reset();
+  active_backdrop_epoch_.reset();
+  active_backdrop_epoch_texture_.reset();
 
   // If requires_readback_ was true, then we rendered to an offscreen texture
   // instead of to the onscreen provided in the render target. Now we need to
@@ -2678,10 +3770,11 @@ bool Canvas::IsCompatibleWithSDFRendering(const Paint& paint) {
 
 LazyRenderingConfig::LazyRenderingConfig(
     ContentContext& renderer,
-    std::unique_ptr<EntityPassTarget> p_entity_pass_target)
+    std::unique_ptr<EntityPassTarget> p_entity_pass_target,
+    bool preserve_depth_stencil_between_passes)
     : entity_pass_target_(std::move(p_entity_pass_target)) {
-  inline_pass_context_ =
-      std::make_unique<InlinePassContext>(renderer, *entity_pass_target_);
+  inline_pass_context_ = std::make_unique<InlinePassContext>(
+      renderer, *entity_pass_target_, preserve_depth_stencil_between_passes);
 }
 
 bool LazyRenderingConfig::IsApplyingClearColor() const {

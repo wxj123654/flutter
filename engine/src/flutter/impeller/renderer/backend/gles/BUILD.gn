@@ -17,6 +17,8 @@ impeller_component("gles_unittests") {
     "blit_command_gles_unittests.cc",
     "buffer_bindings_gles_unittests.cc",
     "command_buffer_gles_unittests.cc",
+    "denial_gpu_audit_gles_unittests.cc",
+    "denial_root_rendering_unittests.cc",
     "device_buffer_gles_unittests.cc",
     "render_pass_gles_unittests.cc",
     "test/capabilities_unittests.cc",
@@ -35,6 +37,7 @@ impeller_component("gles_unittests") {
   ]
   deps = [
     ":gles",
+    "//flutter/impeller/entity",
     "//flutter/impeller/playground:playground_test",
     "//flutter/testing:testing_lib",
   ]
@@ -58,6 +61,9 @@ impeller_component("gles") {
     "command_buffer_gles.h",
     "context_gles.cc",
     "context_gles.h",
+    "denial_gpu_audit_gles.cc",
+    "denial_gpu_audit_gles.h",
+    "denial_resource_audit_gles.h",
     "description_gles.cc",
     "description_gles.h",
     "device_buffer_gles.cc",
@@ -111,5 +117,22 @@ impeller_component("gles") {
     "../../../shader_archive",
     "//flutter/fml",
     "//third_party/abseil-cpp/absl/container:flat_hash_map",
+  ]
+}
+
+# GL mock contracts only: no window, playground, or pixel readback.
+impeller_component("denial_root_rendering_unittests") {
+  target_type = "executable"
+  testonly = true
+  sources = [
+    "denial_root_rendering_unittests.cc",
+    "test/mock_gles.cc",
+  ]
+  deps = [
+    ":gles",
+    "//flutter/impeller/display_list",
+    "//flutter/impeller/entity",
+    "//flutter/testing:testing_lib",
+    "//flutter/third_party/googletest:gtest_main",
   ]
 }

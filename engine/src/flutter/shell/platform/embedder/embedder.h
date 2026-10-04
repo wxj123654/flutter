@@ -3605,6 +3605,161 @@ FlutterEngineResult FlutterEngineScheduleFrame(FLUTTER_API_SYMBOL(FlutterEngine)
                                                    engine);
 
 //------------------------------------------------------------------------------
+/// @brief      Requests a texture-only frame without publishing any dirty
+///             texture identifiers.
+///
+///             This Denial extension lets the compositor prepare AwaitVSync
+///             while the preceding raster transaction is still finishing.
+///             Texture identifiers are published only after that transaction
+///             ends and the next client-buffer generation becomes current.
+///
+/// @param[in]  engine     A running engine instance.
+///
+/// @return the result of the call made to the engine.
+///
+FLUTTER_EXPORT
+FlutterEngineResult DenialFlutterEngineRequestFrameForExternalTextures(
+    FLUTTER_API_SYMBOL(FlutterEngine) engine);
+
+//------------------------------------------------------------------------------
+/// @brief      Records a set of updated external textures and schedules one
+///             frame which reuses the previous layer tree unless the Flutter
+///             framework has independently requested a rebuild.
+///
+///             This Denial extension copies `texture_identifiers`
+///             synchronously. It exists so the compositor can collect all
+///             texture updates and authorize one frame from its KMS clock.
+///
+/// @param[in]  engine               A running engine instance.
+/// @param[in]  texture_identifiers  Non-null array of non-zero texture IDs.
+/// @param[in]  texture_count        Number of IDs; must be greater than zero.
+///
+/// @return the result of the call made to the engine.
+///
+FLUTTER_EXPORT
+FlutterEngineResult DenialFlutterEngineScheduleFrameForExternalTextures(
+    FLUTTER_API_SYMBOL(FlutterEngine) engine,
+    const int64_t* texture_identifiers,
+    size_t texture_count);
+
+//------------------------------------------------------------------------------
+/// @brief      Authorizes one raster transaction for selected Denial physical
+///             outputs. Arrays are copied synchronously. A texture array may
+///             be null only when `texture_count` is zero.
+///
+FLUTTER_EXPORT
+FlutterEngineResult DenialFlutterEngineRenderOutputs(
+    FLUTTER_API_SYMBOL(FlutterEngine) engine,
+    const int64_t* render_view_ids,
+    size_t render_view_count,
+    const int64_t* texture_identifiers,
+    size_t texture_count,
+    bool rebuild_scene,
+    uint64_t frame_start_time_nanos,
+    uint64_t frame_target_time_nanos);
+
+//------------------------------------------------------------------------------
+/// One physical raster target projected from the implicit Flutter view.
+/// Source coordinates are in the implicit view's physical-pixel coordinate
+/// space. Target dimensions are the scanout buffer's native physical extent.
+/// `source_to_target_transform` is an arbitrary affine mapping from the
+/// implicit view directly into that target; KMS does not transform the result.
+typedef struct {
+  size_t struct_size;
+  int64_t render_view_id;
+  uint64_t configuration_generation;
+  double source_physical_x;
+  double source_physical_y;
+  double source_physical_width;
+  double source_physical_height;
+  size_t target_width;
+  size_t target_height;
+  uint32_t scale_120;
+  FlutterTransformation source_to_target_transform;
+} DenialFlutterRenderOutput;
+
+//------------------------------------------------------------------------------
+/// @brief      Atomically replaces Denial's physical raster-target snapshot.
+///
+///             The array is copied synchronously and installed on the raster
+///             thread between frame transactions. Synthetic render view IDs
+///             must be negative and unique. Every entry must belong to the
+///             same non-zero configuration generation. An empty array removes
+///             every physical target.
+///
+/// @param[in]  engine        A running engine instance.
+/// @param[in]  outputs       Complete output snapshot, or null when count is 0.
+/// @param[in]  output_count  Number of entries in `outputs`.
+///
+/// @return the result of the call made to the engine.
+///
+FLUTTER_EXPORT
+FlutterEngineResult DenialFlutterEngineSetRenderOutputs(
+    FLUTTER_API_SYMBOL(FlutterEngine) engine,
+    const DenialFlutterRenderOutput* outputs,
+    size_t output_count);
+
+//------------------------------------------------------------------------------
+/// Callback used to declare whether an external-texture resolve may mutate GL
+/// state or destroy GL/EGL objects. It runs synchronously immediately before
+/// the engine invokes the standard OpenGL external-texture callback for the
+/// same identifier.
+///
+/// Returning false permits the engine to retain its pending Ganesh command
+/// batch and cached GL state across that callback. The embedder must return
+/// true unless the following callback is guaranteed not to call GL.
+typedef bool (*DenialFlutterExternalTextureGlStateCallback)(
+    void* user_data,
+    int64_t texture_identifier);
+
+//------------------------------------------------------------------------------
+/// @brief      Installs Denial's external-texture GL-state preflight callback.
+///
+/// @param[in]  engine     A running OpenGL engine instance.
+/// @param[in]  callback   A non-null synchronous preflight callback.
+/// @param[in]  user_data  Opaque data passed to `callback`.
+///
+/// @return the result of the call made to the engine.
+///
+FLUTTER_EXPORT
+FlutterEngineResult DenialFlutterEngineSetExternalTextureGlStateCallback(
+    FLUTTER_API_SYMBOL(FlutterEngine) engine,
+    DenialFlutterExternalTextureGlStateCallback callback,
+    void* user_data);
+
+// Virtual external-texture canvas. Rectangles are x, y, width, height in
+// pixel coordinates: source addresses the original imported buffer;
+// destination and background address the virtual canvas. No texture storage
+// is allocated. The canvas is clipped to the ordinary TextureLayer bounds.
+// The background extends the texel at offset (5, 5) inside the visible source,
+// clamped for small sources, using its RGBA and the content's inherited paint.
+// This samples the same imported image as the content without CPU readback.
+typedef struct {
+  size_t struct_size;
+  double width;
+  double height;
+  double source[4];
+  double destination[4];
+  double background[4];
+  // Fallback only when the source has no intersection with the imported image.
+  uint32_t background_argb;
+} DenialFlutterExternalTexturePresentation;
+
+// Called once alongside each resolved external image, never for retained
+// paints. Return false for the unmodified image path. The callback must not
+// call GL. Geometry changes require marking the texture frame available.
+typedef bool (*DenialFlutterExternalTexturePresentationCallback)(
+    void* user_data,
+    int64_t texture_identifier,
+    DenialFlutterExternalTexturePresentation* presentation);
+
+FLUTTER_EXPORT
+FlutterEngineResult DenialFlutterEngineSetExternalTexturePresentationCallback(
+    FLUTTER_API_SYMBOL(FlutterEngine) engine,
+    DenialFlutterExternalTexturePresentationCallback callback,
+    void* user_data);
+
+//------------------------------------------------------------------------------
 /// @brief      Schedule a callback to be called after the next frame is drawn.
 ///             This must be called from the platform thread. The callback is
 ///             executed only once from the raster thread; embedders must

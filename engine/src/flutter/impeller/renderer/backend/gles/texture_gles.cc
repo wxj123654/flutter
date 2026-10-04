@@ -15,6 +15,7 @@
 #include "impeller/base/validation.h"
 #include "impeller/core/formats.h"
 #include "impeller/core/texture_descriptor.h"
+#include "impeller/renderer/backend/gles/denial_resource_audit_gles.h"
 #include "impeller/renderer/backend/gles/formats_gles.h"
 
 namespace impeller {
@@ -98,6 +99,28 @@ std::shared_ptr<TextureGLES> TextureGLES::WrapFBO(
     GLuint fbo) {
   auto texture = std::shared_ptr<TextureGLES>(
       new TextureGLES(std::move(reactor), desc, false, fbo, std::nullopt));
+  if (!texture->IsValid()) {
+    return nullptr;
+  }
+  return texture;
+}
+
+std::shared_ptr<TextureGLES> TextureGLES::WrapFBOTexture(
+    std::shared_ptr<ReactorGLES> reactor,
+    TextureDescriptor desc,
+    GLuint fbo,
+    GLuint texture_name) {
+  if (!reactor || texture_name == GL_NONE) {
+    return nullptr;
+  }
+  HandleGLES texture_handle =
+      reactor->CreateHandle(HandleType::kTexture, texture_name);
+  if (!reactor->RegisterCleanupCallback(texture_handle, [] {})) {
+    reactor->CollectHandle(texture_handle);
+    return nullptr;
+  }
+  auto texture = std::shared_ptr<TextureGLES>(
+      new TextureGLES(std::move(reactor), desc, false, fbo, texture_handle));
   if (!texture->IsValid()) {
     return nullptr;
   }
@@ -432,6 +455,10 @@ void TextureGLES::InitializeContentsIfNecessary() {
         VALIDATION_LOG << "Invalid format for texture image.";
         return;
       }
+      const DenialResourceAuditGLES audit(
+          DenialResourceAuditGLES::Stage::kTextureStorage,
+          static_cast<int>(GetTextureDescriptor().format), size.width,
+          size.height);
       TRACE_EVENT0("impeller", "TexImage2DInitialization");
       if (desc.type == TextureType::kTextureCube) {
         // Cubemap handles must be bound to GL_TEXTURE_CUBE_MAP and each face
@@ -484,6 +511,10 @@ void TextureGLES::InitializeContentsIfNecessary() {
       }
       gl.BindRenderbuffer(GL_RENDERBUFFER, handle.value());
       {
+        const DenialResourceAuditGLES audit(
+            DenialResourceAuditGLES::Stage::kRenderbufferStorage,
+            static_cast<int>(GetTextureDescriptor().format), size.width,
+            size.height);
         if (type_ == Type::kRenderBufferMultisampled) {
           // BEWARE: these functions are not at all equivalent! the extensions
           // are from EXT_multisampled_render_to_texture and cannot be used
@@ -746,6 +777,10 @@ bool TextureGLES::SetAsFramebufferAttachment(GLenum target,
   }
 
   return true;
+}
+
+Scalar TextureGLES::GetYCoordScale() const {
+  return wrapped_fbo_.has_value() ? -1.0f : 1.0f;
 }
 
 bool TextureGLES::IsWrapped() const {

@@ -41,10 +41,11 @@ std::shared_ptr<FilterContents> FilterContents::MakeGaussianBlur(
     Entity::TileMode tile_mode,
     std::optional<Rect> bounds,
     FilterContents::BlurStyle mask_blur_style,
-    const Geometry* mask_geometry) {
+    const Geometry* mask_geometry,
+    Scalar downsample_scale) {
   auto blur = std::make_shared<GaussianBlurFilterContents>(
       sigma_x.sigma, sigma_y.sigma, tile_mode, bounds, mask_blur_style,
-      mask_geometry);
+      mask_geometry, downsample_scale);
   blur->SetInputs({input});
   return blur;
 }
@@ -285,6 +286,17 @@ void FilterContents::SetRenderingMode(Entity::RenderingMode rendering_mode) {
   for (auto& input : inputs_) {
     input->SetRenderingMode(rendering_mode);
   }
+}
+
+void FilterContents::SetIsBackdropFilter(bool is_backdrop_filter) {
+  is_backdrop_filter_ = is_backdrop_filter;
+  for (auto& input : inputs_) {
+    input->SetIsBackdropFilter(is_backdrop_filter);
+  }
+}
+
+bool FilterContents::IsBackdropFilter() const {
+  return is_backdrop_filter_;
 }
 
 }  // namespace impeller

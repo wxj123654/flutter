@@ -58,10 +58,10 @@ LerpHackResult LerpHackKernelSamples(const KernelSamples& samples);
 //
 // ## Implementation notes
 //
-// The blur is implemented as a three-pass process:
-// 1. A downsampling pass. This is used for performance optimization on large
-//    blurs.
-// 2. A Y-direction blur pass (in canvas coordinates).
+// The blur is implemented as a separable process:
+// 1. The input is downsampled when beneficial. On GLES, moderate unbounded
+//    blurs fuse this work into the Y-direction blur.
+// 2. A Y-direction blur pass (in canvas coordinates), unless fused above.
 // 3. An X-direction blur pass (in canvas coordinates).
 //
 // ### Lerp Hack
@@ -98,7 +98,8 @@ class GaussianBlurFilterContents final : public FilterContents {
                                       Entity::TileMode tile_mode,
                                       std::optional<Rect> bounds,
                                       BlurStyle mask_blur_style,
-                                      const Geometry* mask_geometry = nullptr);
+                                      const Geometry* mask_geometry = nullptr,
+                                      Scalar downsample_scale = 1.0f);
 
   std::optional<Rect> GetBounds() const { return bounds_; }
   Scalar GetSigmaX() const { return sigma_.x; }
@@ -132,7 +133,7 @@ class GaussianBlurFilterContents final : public FilterContents {
   /// Calculate the scale factor for the downsample pass given a sigma value.
   ///
   /// Visible for testing.
-  static Scalar CalculateScale(Scalar sigma);
+  static Scalar CalculateScale(Scalar sigma, Scalar downsample_scale = 1.0f);
 
   /// Scales down the sigma value to match Skia's behavior.
   ///
@@ -158,6 +159,7 @@ class GaussianBlurFilterContents final : public FilterContents {
   const std::optional<Rect> bounds_ = std::nullopt;
   const BlurStyle mask_blur_style_;
   const Geometry* mask_geometry_ = nullptr;
+  const Scalar downsample_scale_ = 1.0f;
 };
 
 }  // namespace impeller

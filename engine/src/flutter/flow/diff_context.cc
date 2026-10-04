@@ -4,22 +4,60 @@
 
 #include "flutter/flow/diff_context.h"
 
+#include <algorithm>
+#include <atomic>
+
 #include "flutter/flow/layers/layer.h"
 #include "flutter/flow/raster_cache_util.h"
 
 namespace flutter {
+namespace {
+
+std::atomic<uint32_t> g_next_backdrop_cache_family = 1u;
+
+uint32_t NextBackdropCacheFamily() {
+  uint32_t family;
+  do {
+    family =
+        g_next_backdrop_cache_family.fetch_add(1u, std::memory_order_relaxed);
+  } while (family == 0u);
+  return family;
+}
+
+bool RegionsEqual(const DlRegion& a, const DlRegion& b) {
+  return a.getRects(false) == b.getRects(false);
+}
+
+DlRegion RegionFromRects(std::initializer_list<DlIRect> rects) {
+  return DlRegion(std::vector<DlIRect>(rects));
+}
+
+}  // namespace
+
+BackdropFilterCacheState::BackdropFilterCacheState()
+    : family_(NextBackdropCacheFamily()) {}
+
+void BackdropFilterCacheState::Invalidate() {
+  generation_++;
+  if (generation_ == 0u) {
+    family_ = NextBackdropCacheFamily();
+    generation_ = 1u;
+  }
+}
 
 DiffContext::DiffContext(DlISize frame_size,
                          PaintRegionMap& this_frame_paint_region_map,
                          const PaintRegionMap& last_frame_paint_region_map,
                          bool has_raster_cache,
-                         bool impeller_enabled)
+                         bool impeller_enabled,
+                         const std::unordered_set<int64_t>* dirty_texture_ids)
     : rects_(std::make_shared<std::vector<DlRect>>()),
       frame_size_(frame_size),
       this_frame_paint_region_map_(this_frame_paint_region_map),
       last_frame_paint_region_map_(last_frame_paint_region_map),
       has_raster_cache_(has_raster_cache),
-      impeller_enabled_(impeller_enabled) {}
+      impeller_enabled_(impeller_enabled),
+      dirty_texture_ids_(dirty_texture_ids) {}
 
 void DiffContext::BeginSubtree() {
   state_stack_.push_back(state_);
@@ -77,9 +115,12 @@ DlRect DiffContext::ApplyFilterBoundsAdjustment(DlRect rect) const {
   return rect;
 }
 
-void DiffContext::AlignRect(DlIRect& rect,
-                            int horizontal_alignment,
-                            int vertical_alignment) const {
+DlIRect DiffContext::AlignRect(const DlIRect& input,
+                               int horizontal_alignment,
+                               int vertical_alignment) const {
+  horizontal_alignment = std::max(horizontal_alignment, 1);
+  vertical_alignment = std::max(vertical_alignment, 1);
+  DlIRect rect = input;
   auto top = rect.GetTop();
   auto left = rect.GetLeft();
   auto right = rect.GetRight();
@@ -98,42 +139,111 @@ void DiffContext::AlignRect(DlIRect& rect,
   }
   right = std::min(right, frame_size_.width);
   bottom = std::min(bottom, frame_size_.height);
-  rect = DlIRect::MakeLTRB(left, top, right, bottom);
+  return DlIRect::MakeLTRB(left, top, right, bottom);
 }
 
-Damage DiffContext::ComputeDamage(const DlIRect& accumulated_buffer_damage,
-                                  int horizontal_clip_alignment,
-                                  int vertical_clip_alignment) const {
-  DlRect buffer_damage = DlRect::Make(accumulated_buffer_damage).Union(damage_);
-  DlRect frame_damage(damage_);
-
-  for (const auto& r : readbacks_) {
-    DlRect paint_rect = DlRect::Make(r.paint_rect);
-    DlRect readback_rect = DlRect::Make(r.readback_rect);
-    // Changes either in readback or paint rect require repainting both readback
-    // and paint rect.
-    if (paint_rect.IntersectsWithRect(frame_damage) ||
-        readback_rect.IntersectsWithRect(frame_damage)) {
-      frame_damage = frame_damage.Union(readback_rect).Union(paint_rect);
-      buffer_damage = buffer_damage.Union(readback_rect).Union(paint_rect);
+DlRegion DiffContext::AlignRegion(const DlRegion& region,
+                                  int horizontal_alignment,
+                                  int vertical_alignment) const {
+  if (horizontal_alignment <= 1 && vertical_alignment <= 1) {
+    return region;
+  }
+  std::vector<DlIRect> aligned;
+  for (const DlIRect& rect : region.getRects()) {
+    DlIRect aligned_rect =
+        AlignRect(rect, horizontal_alignment, vertical_alignment);
+    if (!aligned_rect.IsEmpty()) {
+      aligned.push_back(aligned_rect);
     }
   }
+  return DlRegion(aligned);
+}
 
-  DlIRect frame_clip = DlIRect::MakeSize(frame_size_);
+Damage DiffContext::ComputeDamage(
+    const std::optional<DlRegion>& accumulated_buffer_damage,
+    int horizontal_clip_alignment,
+    int vertical_clip_alignment,
+    const BackdropSnapshotPin& pin_backdrop) const {
+  const DlRegion frame_clip(DlIRect::MakeSize(frame_size_));
+  DlRegion frame_damage = DlRegion::MakeIntersection(damage_, frame_clip);
+  DlRegion buffer_damage =
+      accumulated_buffer_damage
+          ? DlRegion::MakeIntersection(
+                DlRegion::MakeUnion(frame_damage,
+                                    accumulated_buffer_damage.value()),
+                frame_clip)
+          : frame_clip;
 
-  Damage res;
-  res.buffer_damage =
-      DlIRect::RoundOut(buffer_damage).IntersectionOrEmpty(frame_clip);
-  res.frame_damage =
-      DlIRect::RoundOut(frame_damage).IntersectionOrEmpty(frame_clip);
-
-  if (horizontal_clip_alignment > 1 || vertical_clip_alignment > 1) {
-    AlignRect(res.buffer_damage, horizontal_clip_alignment,
-              vertical_clip_alignment);
-    AlignRect(res.frame_damage, horizontal_clip_alignment,
-              vertical_clip_alignment);
+  std::vector<const ReadbackRegion*> dependencies;
+  if (cached_readback_regions_) {
+    FML_DCHECK(readbacks_.empty());
+    for (const auto& readback : *cached_readback_regions_) {
+      dependencies.push_back(&readback);
+    }
+  } else {
+    for (const auto& readback : readbacks_) {
+      dependencies.push_back(&readback);
+    }
   }
-  return res;
+  if (pin_backdrop) {
+    // Only independent, single-use filters qualify. Shared filters require
+    // agreeing on their combined coverage and filter equality at dispatch.
+    std::unordered_map<int64_t, size_t> uses;
+    for (const auto* readback : dependencies) {
+      if (readback->cache_state) {
+        uses[readback->cache_state->token()]++;
+      }
+    }
+    std::erase_if(dependencies, [&](const ReadbackRegion* readback) {
+      return readback->cache_state &&
+             uses[readback->cache_state->token()] == 1u &&
+             pin_backdrop(readback->cache_state->token(),
+                          readback->cache_coverage);
+    });
+  }
+
+  // Readback dependencies can form a chain. Expanding one region may intersect
+  // a dependency visited earlier, so iterate to a fixed point. Frame damage and
+  // historical buffer repair are expanded independently: historical damage
+  // must repair the selected buffer without being reported as a new front
+  // buffer change.
+  bool expanded;
+  do {
+    expanded = false;
+    auto expand_readback = [&](const DlIRect& paint_rect,
+                               const DlIRect& readback_rect) {
+      const DlRegion dependency = DlRegion::MakeIntersection(
+          RegionFromRects({paint_rect, readback_rect}), frame_clip);
+
+      if (frame_damage.intersects(dependency)) {
+        DlRegion expanded_frame = DlRegion::MakeUnion(frame_damage, dependency);
+        if (!RegionsEqual(frame_damage, expanded_frame)) {
+          frame_damage = std::move(expanded_frame);
+          expanded = true;
+        }
+      }
+
+      if (buffer_damage.intersects(dependency)) {
+        DlRegion expanded_buffer =
+            DlRegion::MakeUnion(buffer_damage, dependency);
+        if (!RegionsEqual(buffer_damage, expanded_buffer)) {
+          buffer_damage = std::move(expanded_buffer);
+          expanded = true;
+        }
+      }
+    };
+
+    for (const auto* readback : dependencies) {
+      expand_readback(readback->paint_rect, readback->readback_rect);
+    }
+  } while (expanded);
+
+  return Damage{
+      .frame_damage = AlignRegion(frame_damage, horizontal_clip_alignment,
+                                  vertical_clip_alignment),
+      .buffer_damage = AlignRegion(buffer_damage, horizontal_clip_alignment,
+                                   vertical_clip_alignment),
+  };
 }
 
 DlRect DiffContext::MapRect(const DlRect& rect) {
@@ -208,15 +318,197 @@ void DiffContext::AddExistingPaintRegion(const PaintRegion& region) {
   }
 }
 
-void DiffContext::AddReadbackRegion(const DlIRect& paint_rect,
-                                    const DlIRect& readback_rect) {
+void DiffContext::AddReadbackRegion(
+    const DlIRect& paint_rect,
+    const DlIRect& readback_rect,
+    std::shared_ptr<BackdropFilterCacheState> cache_state,
+    std::optional<DlRect> cache_coverage) {
   Readback readback;
   readback.paint_rect = paint_rect;
   readback.readback_rect = readback_rect;
+  readback.cache_coverage = cache_coverage.value_or(DlRect::Make(paint_rect));
+  // Ancestor image filters can change the coordinate space and raster extent
+  // of an intermediate target. Keep their ordinary readback repair path.
+  if (filter_bounds_adjustment_stack_.empty()) {
+    readback.cache_state = std::move(cache_state);
+  }
   readback.position = rects_->size();
   // Push empty rect as a placeholder for position in current subtree
   rects_->push_back(DlRect());
   readbacks_.push_back(readback);
+  if (readback_region_cache_) {
+    readback_region_cache_->push_back(readback);
+  }
+}
+
+bool DiffContext::BackdropInputIsDirty(const DlIRect& readback_rect) const {
+  return damage_.intersects(DlRegion(readback_rect));
+}
+
+std::shared_ptr<BackdropFilterCacheState>
+DiffContext::RegisterBackdropFilterCache(
+    std::optional<int64_t> group_id,
+    std::shared_ptr<BackdropFilterCacheState> state,
+    const DlIRect& readback_rect) {
+  if (group_id.has_value()) {
+    auto [entry, inserted] =
+        backdrop_group_states_.try_emplace(group_id.value(), state);
+    if (!inserted) {
+      state = entry->second;
+    }
+  }
+
+  if (backdrop_filter_cache_) {
+    BackdropFilterCacheMetadata metadata{.state = state};
+    std::unordered_set<int64_t> seen;
+    for (const auto& texture : *texture_region_cache_) {
+      bool intersects = false;
+      for (const DlRect& rect : texture.paint_region) {
+        if (DlIRect::RoundOut(rect).IntersectsWithRect(readback_rect)) {
+          intersects = true;
+          break;
+        }
+      }
+      if (intersects && seen.insert(texture.texture_id).second) {
+        metadata.input_texture_ids.push_back(texture.texture_id);
+      }
+    }
+    backdrop_filter_cache_->push_back(std::move(metadata));
+  }
+  return state;
+}
+
+void DiffContext::SetDiffMetadataCache(
+    TexturePaintRegionList* texture_regions,
+    ReadbackRegionList* readback_regions,
+    BackdropFilterCacheMetadataList* backdrop_filter_caches,
+    RetainedSubtreeDiffMetadataMap* retained_subtrees,
+    const RetainedSubtreeDiffMetadataMap* previous_retained_subtrees) {
+  FML_DCHECK(texture_regions);
+  FML_DCHECK(readback_regions);
+  FML_DCHECK(backdrop_filter_caches);
+  FML_DCHECK(retained_subtrees);
+  FML_DCHECK(!cached_readback_regions_);
+  texture_regions->clear();
+  readback_regions->clear();
+  backdrop_filter_caches->clear();
+  retained_subtrees->clear();
+  texture_region_cache_ = texture_regions;
+  readback_region_cache_ = readback_regions;
+  backdrop_filter_cache_ = backdrop_filter_caches;
+  retained_subtree_cache_ = retained_subtrees;
+  previous_retained_subtree_cache_ = previous_retained_subtrees;
+}
+
+void DiffContext::CacheTexturePaintRegion(int64_t texture_id,
+                                          const PaintRegion& paint_region) {
+  if (texture_region_cache_) {
+    texture_region_cache_->push_back({texture_id, paint_region});
+  }
+  if (retained_subtree_capture_) {
+    retained_subtree_capture_->texture_paint_regions.push_back(
+        {texture_id, paint_region});
+  }
+}
+
+bool DiffContext::TryReuseRetainedSubtreeMetadata(
+    const Layer* layer,
+    const PaintRegion& paint_region) {
+  FML_DCHECK(layer);
+  FML_DCHECK(paint_region.is_valid());
+  FML_DCHECK(paint_region.has_texture());
+  FML_DCHECK(!paint_region.has_readback());
+  if (!previous_retained_subtree_cache_ || !retained_subtree_cache_ ||
+      !texture_region_cache_) {
+    return false;
+  }
+
+  const auto previous =
+      previous_retained_subtree_cache_->find(layer->unique_id());
+  if (previous == previous_retained_subtree_cache_->end()) {
+    return false;
+  }
+
+  const auto& metadata = previous->second;
+  // The geometry metadata remains valid even when texture contents are dirty.
+  // Carry the block forward so a later clean frame can reuse it after this
+  // frame performs the normal damage-producing diff.
+  retained_subtree_cache_->insert_or_assign(layer->unique_id(), metadata);
+
+  if (!dirty_texture_ids_ ||
+      std::any_of(metadata->texture_paint_regions.begin(),
+                  metadata->texture_paint_regions.end(),
+                  [&](const TexturePaintRegion& texture) {
+                    return dirty_texture_ids_->contains(texture.texture_id);
+                  })) {
+    return false;
+  }
+
+  AddExistingPaintRegion(paint_region);
+  MarkSubtreeHasTextureLayer();
+  for (const auto& entry : metadata->layer_paint_regions) {
+    this_frame_paint_region_map_.insert_or_assign(entry.layer_id,
+                                                  entry.paint_region);
+    if (retained_subtree_capture_) {
+      retained_subtree_capture_->layer_paint_regions.push_back(entry);
+    }
+  }
+  texture_region_cache_->insert(texture_region_cache_->end(),
+                                metadata->texture_paint_regions.begin(),
+                                metadata->texture_paint_regions.end());
+  if (retained_subtree_capture_) {
+    retained_subtree_capture_->texture_paint_regions.insert(
+        retained_subtree_capture_->texture_paint_regions.end(),
+        metadata->texture_paint_regions.begin(),
+        metadata->texture_paint_regions.end());
+  }
+  return true;
+}
+
+DiffContext::AutoRetainedSubtreeMetadataCapture::
+    AutoRetainedSubtreeMetadataCapture(DiffContext* context, const Layer* layer)
+    : context_(context),
+      active_(context_->BeginRetainedSubtreeMetadataCapture(layer)) {}
+
+DiffContext::AutoRetainedSubtreeMetadataCapture::
+    ~AutoRetainedSubtreeMetadataCapture() {
+  if (active_) {
+    context_->EndRetainedSubtreeMetadataCapture();
+  }
+}
+
+bool DiffContext::BeginRetainedSubtreeMetadataCapture(const Layer* layer) {
+  FML_DCHECK(layer);
+  if (retained_subtree_capture_.has_value() || !retained_subtree_cache_ ||
+      !texture_region_cache_) {
+    return false;
+  }
+  retained_subtree_capture_ = RetainedSubtreeCapture{
+      .layer_id = layer->unique_id(),
+  };
+  return true;
+}
+
+void DiffContext::EndRetainedSubtreeMetadataCapture() {
+  FML_DCHECK(retained_subtree_capture_.has_value());
+  FML_DCHECK(retained_subtree_cache_);
+  FML_DCHECK(texture_region_cache_);
+  RetainedSubtreeCapture capture = std::move(*retained_subtree_capture_);
+  retained_subtree_capture_.reset();
+
+  auto metadata = std::make_shared<RetainedSubtreeDiffMetadata>();
+  metadata->layer_paint_regions = std::move(capture.layer_paint_regions);
+  metadata->texture_paint_regions = std::move(capture.texture_paint_regions);
+  FML_DCHECK(!metadata->texture_paint_regions.empty());
+  retained_subtree_cache_->insert_or_assign(capture.layer_id,
+                                            std::move(metadata));
+}
+
+void DiffContext::UseCachedReadbackRegions(
+    const ReadbackRegionList* readback_regions) {
+  FML_DCHECK(!readback_region_cache_);
+  FML_DCHECK(readbacks_.empty());
+  cached_readback_regions_ = readback_regions;
 }
 
 PaintRegion DiffContext::CurrentSubtreeRegion() const {
@@ -230,17 +522,25 @@ PaintRegion DiffContext::CurrentSubtreeRegion() const {
 void DiffContext::AddDamage(const PaintRegion& damage) {
   FML_DCHECK(damage.is_valid());
   for (const auto& r : damage) {
-    damage_ = damage_.Union(r);
+    AddDamage(r);
   }
 }
 
 void DiffContext::AddDamage(const DlRect& rect) {
-  damage_ = damage_.Union(rect);
+  DlIRect damage_rect = DlIRect::RoundOut(rect).IntersectionOrEmpty(
+      DlIRect::MakeSize(frame_size_));
+  if (!damage_rect.IsEmpty()) {
+    damage_ = DlRegion::MakeUnion(damage_, DlRegion(damage_rect));
+  }
 }
 
 void DiffContext::SetLayerPaintRegion(const Layer* layer,
                                       const PaintRegion& region) {
-  this_frame_paint_region_map_[layer->unique_id()] = region;
+  this_frame_paint_region_map_.insert_or_assign(layer->unique_id(), region);
+  if (retained_subtree_capture_) {
+    retained_subtree_capture_->layer_paint_regions.push_back(
+        {layer->unique_id(), region});
+  }
 }
 
 PaintRegion DiffContext::GetOldLayerPaintRegion(const Layer* layer) const {

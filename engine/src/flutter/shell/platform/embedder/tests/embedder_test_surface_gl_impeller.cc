@@ -39,6 +39,7 @@ TEST(EmbedderSurfaceGLImpellerTest, GLES3ContextHasGLES3Shaders) {
       StubDispatchTable(/* version */ "OpenGL ES 3.0");
   const auto surface = EmbedderSurfaceGLImpeller(
       gl_dispatch_table, /* fbo_reset_after_present */ false,
+      /* fbo_zero_is_no_target */ false,
       /* external_view_embedder */ nullptr);
 
   const std::shared_ptr<impeller::Context> context =
@@ -61,6 +62,7 @@ TEST(EmbedderSurfaceGLImpellerTest, GLES2ContextDoesNotHaveGLES3Shaders) {
       StubDispatchTable(/* version */ "OpenGL ES 2.0");
   const auto surface = EmbedderSurfaceGLImpeller(
       gl_dispatch_table, /* fbo_reset_after_present */ false,
+      /* fbo_zero_is_no_target */ false,
       /* external_view_embedder */ nullptr);
 
   const std::shared_ptr<impeller::Context> context =
@@ -76,6 +78,87 @@ TEST(EmbedderSurfaceGLImpellerTest, GLES2ContextDoesNotHaveGLES3Shaders) {
   const auto text =
       std::string_view(reinterpret_cast<const char*>(source->GetMapping()));
   EXPECT_THAT(text, StartsWith("#version 100"));
+}
+
+TEST(EmbedderSurfaceGLImpellerTest, ReleasesResourceContextThroughEmbedder) {
+  auto gl_dispatch_table = StubDispatchTable(/* version */ "OpenGL ES 3.0");
+  size_t resource_make_count = 0u;
+  size_t clear_count = 0u;
+  gl_dispatch_table.gl_make_resource_current_callback = [&] {
+    resource_make_count++;
+    return true;
+  };
+  gl_dispatch_table.gl_clear_current_callback = [&] {
+    clear_count++;
+    return true;
+  };
+  auto surface = EmbedderSurfaceGLImpeller(
+      gl_dispatch_table, /* fbo_reset_after_present */ false,
+      /* fbo_zero_is_no_target */ false,
+      /* external_view_embedder */ nullptr);
+  const EmbedderSurface& embedder_surface = surface;
+  std::weak_ptr<impeller::Context> context =
+      embedder_surface.CreateImpellerContext();
+  const size_t clears_after_construction = clear_count;
+
+  embedder_surface.CreateResourceContext();
+  embedder_surface.ReleaseResourceContext();
+
+  EXPECT_EQ(resource_make_count, 1u);
+  EXPECT_EQ(clear_count, clears_after_construction + 1u);
+  EXPECT_TRUE(context.expired());
+}
+
+TEST(EmbedderSurfaceGLImpellerTest,
+     ImpellerPresentPreservesFBOAndReportsDamage) {
+  auto gl_dispatch_table = StubDispatchTable(/* version */ "OpenGL ES 3.0");
+  uint32_t presented_fbo = 0u;
+  std::optional<DlRegion> frame_damage;
+  std::optional<DlRegion> buffer_damage;
+  gl_dispatch_table.gl_present_callback = [&](const GLPresentInfo& info) {
+    presented_fbo = info.fbo_id;
+    frame_damage = info.frame_damage;
+    buffer_damage = info.buffer_damage;
+    return true;
+  };
+  auto surface = EmbedderSurfaceGLImpeller(
+      gl_dispatch_table, /* fbo_reset_after_present */ false,
+      /* fbo_zero_is_no_target */ false,
+      /* external_view_embedder */ nullptr);
+
+  const DlISize frame_size = DlISize(64, 32);
+  const DlRegion expected_frame_damage(DlIRect::MakeLTRB(4, 5, 20, 16));
+  const DlRegion expected_buffer_damage(DlIRect::MakeLTRB(2, 3, 24, 18));
+  SurfaceFrame::SubmitInfo submit_info = {
+      .frame_damage = expected_frame_damage,
+      .buffer_damage = expected_buffer_damage,
+  };
+  EXPECT_TRUE(GPUSurfaceGLImpeller::PresentFrame(&surface, /* fbo_id */ 73u,
+                                                 frame_size, submit_info));
+  EXPECT_EQ(presented_fbo, 73u);
+  ASSERT_TRUE(frame_damage.has_value());
+  ASSERT_TRUE(buffer_damage.has_value());
+  EXPECT_EQ(frame_damage->getRects(), expected_frame_damage.getRects());
+  EXPECT_EQ(buffer_damage->getRects(), expected_buffer_damage.getRects());
+}
+
+TEST(EmbedderSurfaceGLImpellerTest,
+     ImpellerUsesEmbedderRootSurfaceTransformation) {
+  auto gl_dispatch_table = StubDispatchTable(/* version */ "OpenGL ES 3.0");
+  const DlMatrix expected = DlMatrix::MakeTranslation({0.0, 32.0}) *
+                            DlMatrix::MakeScale({1.0, -1.0, 1.0});
+  gl_dispatch_table.gl_surface_transformation_callback = [expected] {
+    return expected;
+  };
+  auto surface = EmbedderSurfaceGLImpeller(
+      gl_dispatch_table, /* fbo_reset_after_present */ false,
+      /* fbo_zero_is_no_target */ false,
+      /* external_view_embedder */ nullptr);
+
+  DisplayListBuilder canvas(DlRect::MakeWH(64.0, 32.0));
+  GPUSurfaceGLImpeller::ConfigureRootCanvas(&canvas, &surface);
+
+  EXPECT_EQ(canvas.GetMatrix(), expected);
 }
 }  // namespace testing
 }  // namespace flutter

@@ -8,6 +8,7 @@
 #include <memory>
 #include <utility>
 
+#include "flutter/common/backdrop_filter_cache_key.h"
 #include "flutter/display_list/image/dl_image.h"
 #include "fml/trace_event.h"
 #include "impeller/base/validation.h"
@@ -30,6 +31,10 @@
 namespace impeller {
 
 namespace {
+
+constexpr size_t kBackdropSnapshotCacheMaxEntries = 64u;
+constexpr size_t kBackdropSnapshotCacheMaxBytes = 64u * 1024u * 1024u;
+constexpr size_t kBackdropSnapshotObservationMaxEntries = 128u;
 
 /// A generic version of `Variants` which mostly exists to reduce code size.
 class GenericVariants {
@@ -264,6 +269,7 @@ struct ContentContext::Pipelines {
   Variants<FramebufferBlendScreenPipeline> framebuffer_blend_screen;
   Variants<FramebufferBlendSoftLightPipeline> framebuffer_blend_softlight;
   Variants<GaussianBlurPipeline> gaussian_blur;
+  Variants<GlassPipeline> glass;
   Variants<GlyphAtlasPipeline> glyph_atlas;
   Variants<LinePipeline> line;
   Variants<LinearGradientFillPipeline> linear_gradient_fill;
@@ -310,6 +316,9 @@ struct ContentContext::Pipelines {
 
 // Web doesn't support external texture OpenGL extensions
 #if defined(IMPELLER_ENABLE_OPENGLES) && !defined(FML_OS_EMSCRIPTEN)
+  Variants<BackdropSurfaceCompositePipeline> backdrop_surface_composite;
+  Variants<BackdropSurfaceCompositeTexturePipeline>
+      backdrop_surface_composite_texture;
   Variants<TiledTextureExternalPipeline> tiled_texture_external;
   Variants<TiledTextureUvExternalPipeline> tiled_texture_uv_external;
 #endif
@@ -715,6 +724,10 @@ ContentContext::ContentContext(
                                             {supports_decal});
     pipelines_->gaussian_blur.CreateDefault(
         *context_, options_no_msaa_no_depth_stencil, {supports_decal});
+    // Direct glass draws consume the parent's depth clip. Variants can strip
+    // attachments for offscreen filtering, but cannot recover stripped
+    // defaults.
+    pipelines_->glass.CreateDefault(*context_, options_trianglestrip);
     pipelines_->border_mask_blur.CreateDefault(*context_,
                                                options_trianglestrip);
     pipelines_->color_matrix_color_filter.CreateDefault(*context_,
@@ -865,6 +878,9 @@ ContentContext::ContentContext(
 #if defined(IMPELLER_ENABLE_OPENGLES) && !defined(FML_OS_MACOSX) && \
     !defined(FML_OS_EMSCRIPTEN)
     // GLES only shader that is unsupported on macOS and web.
+    pipelines_->backdrop_surface_composite.CreateDefault(*context_, options);
+    pipelines_->backdrop_surface_composite_texture.CreateDefault(*context_,
+                                                                 options);
     pipelines_->tiled_texture_external.CreateDefault(*context_, options);
     pipelines_->tiled_texture_uv_external.CreateDefault(*context_, options);
 #endif  // !defined(FML_OS_MACOSX)
@@ -1020,6 +1036,171 @@ void ContentContext::ResetTransientsBuffers() {
   }
 }
 
+std::optional<Snapshot> ContentContext::GetCachedBackdropSnapshot(int64_t key) {
+  for (auto* pins = backdrop_snapshot_pins_; pins; pins = pins->previous_) {
+    auto pinned = pins->snapshots_.find(key);
+    if (pinned != pins->snapshots_.end()) {
+      return pinned->second;
+    }
+  }
+  auto found = backdrop_snapshot_cache_.find(key);
+  if (found == backdrop_snapshot_cache_.end()) {
+    return std::nullopt;
+  }
+  found->second.last_access = ++backdrop_snapshot_cache_access_;
+  return found->second.snapshot;
+}
+
+BackdropSnapshotPins::BackdropSnapshotPins(ContentContext& context,
+                                           const Matrix& damage_to_snapshot)
+    : context_(context),
+      damage_to_snapshot_(damage_to_snapshot),
+      previous_(context.backdrop_snapshot_pins_) {
+  context_.backdrop_snapshot_pins_ = this;
+}
+
+BackdropSnapshotPins::~BackdropSnapshotPins() {
+  FML_DCHECK(context_.backdrop_snapshot_pins_ == this);
+  context_.backdrop_snapshot_pins_ = previous_;
+}
+
+bool BackdropSnapshotPins::Pin(int64_t key, const Rect& coverage) {
+  // Perspective and rotated intermediate extents need a more general mapping
+  // contract. Keep their readback repair path rather than guessing coverage.
+  if (!damage_to_snapshot_.IsFinite() ||
+      !damage_to_snapshot_.IsTranslationScaleOnly()) {
+    return false;
+  }
+  auto snapshot = context_.GetCachedBackdropSnapshot(key);
+  const auto cached_coverage =
+      snapshot.has_value() ? snapshot->GetCoverage() : std::nullopt;
+  if (!cached_coverage || !cached_coverage->Contains(
+                              coverage.TransformBounds(damage_to_snapshot_))) {
+    return false;
+  }
+  snapshots_.insert_or_assign(key, std::move(*snapshot));
+  return true;
+}
+
+void ContentContext::RetireOlderBackdropSnapshotGenerations(int64_t key) {
+  const uint32_t family = flutter::GetBackdropFilterCacheFamily(key);
+  if (family == 0u) {
+    return;
+  }
+  for (auto existing = backdrop_snapshot_cache_.begin();
+       existing != backdrop_snapshot_cache_.end();) {
+    if (existing->first != key &&
+        flutter::GetBackdropFilterCacheFamily(existing->first) == family) {
+      backdrop_snapshot_cache_bytes_ -= existing->second.byte_size;
+      existing = backdrop_snapshot_cache_.erase(existing);
+    } else {
+      existing++;
+    }
+  }
+}
+
+bool ContentContext::ShouldMaterializeBackdropSnapshot(int64_t key) {
+  const uint32_t family = flutter::GetBackdropFilterCacheFamily(key);
+  if (family == 0u) {
+    // Legacy IDs do not encode a generation. Preserve their eager caching
+    // behavior because a changing value cannot be distinguished from a new
+    // semantic group.
+    return true;
+  }
+
+  RetireOlderBackdropSnapshotGenerations(key);
+  const uint64_t access = ++backdrop_snapshot_observation_access_;
+  auto [found, inserted] = backdrop_snapshot_observations_.try_emplace(
+      family, BackdropSnapshotObservation{key, 1u, access});
+  if (!inserted) {
+    BackdropSnapshotObservation& observation = found->second;
+    observation.last_access = access;
+    if (observation.key != key) {
+      observation.key = key;
+      observation.observations = observation.reused ? 2u : 1u;
+      observation.reused = false;
+    } else if (observation.observations < 2u) {
+      observation.observations++;
+    }
+  }
+
+  while (backdrop_snapshot_observations_.size() >
+         kBackdropSnapshotObservationMaxEntries) {
+    auto oldest = backdrop_snapshot_observations_.end();
+    for (auto candidate = backdrop_snapshot_observations_.begin();
+         candidate != backdrop_snapshot_observations_.end(); ++candidate) {
+      if (candidate->first == family) {
+        continue;
+      }
+      if (oldest == backdrop_snapshot_observations_.end() ||
+          candidate->second.last_access < oldest->second.last_access) {
+        oldest = candidate;
+      }
+    }
+    if (oldest == backdrop_snapshot_observations_.end()) {
+      break;
+    }
+    backdrop_snapshot_observations_.erase(oldest);
+  }
+
+  return found->second.observations >= 2u;
+}
+
+void ContentContext::RecordBackdropSnapshotReuse(int64_t key) {
+  const auto family = flutter::GetBackdropFilterCacheFamily(key);
+  auto found = backdrop_snapshot_observations_.find(family);
+  if (found != backdrop_snapshot_observations_.end() &&
+      found->second.key == key) {
+    found->second.reused = true;
+  }
+}
+
+void ContentContext::CacheBackdropSnapshot(int64_t key,
+                                           const Snapshot& snapshot) {
+  if (!snapshot.texture) {
+    return;
+  }
+
+  // A filter's previous generations can never become valid again. Retiring
+  // them here prevents moving filters from evicting unrelated snapshots.
+  RetireOlderBackdropSnapshotGenerations(key);
+
+  const size_t byte_size =
+      snapshot.texture->GetTextureDescriptor().GetByteSizeOfBaseMipLevel();
+
+  auto found = backdrop_snapshot_cache_.find(key);
+  if (found != backdrop_snapshot_cache_.end()) {
+    backdrop_snapshot_cache_bytes_ -= found->second.byte_size;
+    found->second = BackdropSnapshotCacheEntry{
+        snapshot, byte_size, ++backdrop_snapshot_cache_access_};
+  } else {
+    backdrop_snapshot_cache_.emplace(
+        key, BackdropSnapshotCacheEntry{snapshot, byte_size,
+                                        ++backdrop_snapshot_cache_access_});
+  }
+  backdrop_snapshot_cache_bytes_ += byte_size;
+
+  while (backdrop_snapshot_cache_.size() > kBackdropSnapshotCacheMaxEntries ||
+         backdrop_snapshot_cache_bytes_ > kBackdropSnapshotCacheMaxBytes) {
+    auto oldest = backdrop_snapshot_cache_.end();
+    for (auto candidate = backdrop_snapshot_cache_.begin();
+         candidate != backdrop_snapshot_cache_.end(); ++candidate) {
+      if (candidate->first == key) {
+        continue;
+      }
+      if (oldest == backdrop_snapshot_cache_.end() ||
+          candidate->second.last_access < oldest->second.last_access) {
+        oldest = candidate;
+      }
+    }
+    if (oldest == backdrop_snapshot_cache_.end()) {
+      break;
+    }
+    backdrop_snapshot_cache_bytes_ -= oldest->second.byte_size;
+    backdrop_snapshot_cache_.erase(oldest);
+  }
+}
+
 void ContentContext::InitializeCommonlyUsedShadersIfNeeded() const {
   GetContext()->InitializeCommonlyUsedShadersIfNeeded();
 }
@@ -1164,6 +1345,10 @@ PipelineRef ContentContext::GetTiledTexturePipeline(
 PipelineRef ContentContext::GetGaussianBlurPipeline(
     ContentContextOptions opts) const {
   return GetPipeline(this, pipelines_->gaussian_blur, opts);
+}
+
+PipelineRef ContentContext::GetGlassPipeline(ContentContextOptions opts) const {
+  return GetPipeline(this, pipelines_->glass, opts);
 }
 
 PipelineRef ContentContext::GetBorderMaskBlurPipeline(
@@ -1547,6 +1732,19 @@ PipelineRef ContentContext::GetLinePipeline(ContentContextOptions opts) const {
 #ifdef IMPELLER_ENABLE_OPENGLES
 
 #if !defined(FML_OS_EMSCRIPTEN)
+PipelineRef ContentContext::GetBackdropSurfaceCompositePipeline(
+    ContentContextOptions opts) const {
+  FML_DCHECK(GetContext()->GetBackendType() == Context::BackendType::kOpenGLES);
+  return GetPipeline(this, pipelines_->backdrop_surface_composite, opts);
+}
+
+PipelineRef ContentContext::GetBackdropSurfaceCompositeTexturePipeline(
+    ContentContextOptions opts) const {
+  FML_DCHECK(GetContext()->GetBackendType() == Context::BackendType::kOpenGLES);
+  return GetPipeline(this, pipelines_->backdrop_surface_composite_texture,
+                     opts);
+}
+
 PipelineRef ContentContext::GetTiledTextureUvExternalPipeline(
     ContentContextOptions opts) const {
   FML_DCHECK(GetContext()->GetBackendType() == Context::BackendType::kOpenGLES);

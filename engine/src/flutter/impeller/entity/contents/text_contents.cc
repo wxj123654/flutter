@@ -39,6 +39,8 @@ Point SizeToPoint(Size size) {
 }
 }  // namespace
 
+}  // namespace
+
 using VS = GlyphAtlasPipeline::VertexShader;
 using FS = GlyphAtlasPipeline::FragmentShader;
 
@@ -248,6 +250,8 @@ bool TextContents::Render(const ContentContext& renderer,
   if (color.IsTransparent()) {
     return true;
   }
+
+  pass.SetCommandAuditCategory(CommandAuditCategory::kText);
 
   GlyphAtlas::Type type = frame_->GetAtlasType();
   const std::shared_ptr<GlyphAtlas>& atlas =

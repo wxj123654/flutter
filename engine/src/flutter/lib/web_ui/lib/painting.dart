@@ -659,17 +659,49 @@ _ColorTransform _getColorTransform(ColorSpace source, ColorSpace destination) {
 enum FilterQuality { none, low, medium, high }
 
 class ImageFilter {
+  // ignore: avoid_unused_constructor_parameters
   factory ImageFilter.blur({
     double sigmaX = 0.0,
     double sigmaY = 0.0,
     TileMode? tileMode,
     Rect? bounds,
+    // Impeller resolution and native-compositor alpha controls do not apply on Web.
+    double downsampleScale = 1.0,
+    double? backdropAlphaThreshold,
+    bool backdropAlphaThresholdIsSingleSurface = false,
   }) => engine.renderer.createBlurImageFilter(
     sigmaX: sigmaX,
     sigmaY: sigmaY,
     tileMode: tileMode,
     bounds: bounds,
   );
+
+  // ignore: avoid_unused_constructor_parameters
+  factory ImageFilter.glass({
+    double sigmaX = 14,
+    double sigmaY = 14,
+    required RRect shape,
+    double downsampleScale = 0.75,
+    double thickness = 20,
+    double refraction = 0.55,
+    double dispersion = 0.12,
+    double saturation = 1.2,
+    Color tint = const Color(0xffffffff),
+    double tintStrength = 0.08,
+    double brightness = 0.06,
+    double lightAngle = 3.9269908169872414,
+    double lightIntensity = 0.7,
+    double edgeStrength = 0.65,
+    double bevelWidthScale = 1.0,
+    double refractionDepthScale = 1.0,
+    double rimWidth = 1.5,
+    double rimFalloff = 0.89,
+    double oppositeLightStrength = 0.8,
+    double? backdropAlphaThreshold,
+    bool backdropAlphaThresholdIsSingleSurface = false,
+  }) {
+    throw UnsupportedError('ImageFilter.glass requires the Denial native rendering engine.');
+  }
 
   factory ImageFilter.dilate({double radiusX = 0.0, double radiusY = 0.0}) =>
       engine.renderer.createDilateImageFilter(radiusX: radiusX, radiusY: radiusY);

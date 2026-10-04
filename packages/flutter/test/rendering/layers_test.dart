@@ -13,6 +13,26 @@ import 'rendering_tester.dart';
 void main() {
   TestRenderingFlutterBinding.ensureInitialized();
 
+  test('output-relative transform uses fallback size for layer coordinates', () {
+    final layer = OutputRelativeTransformLayer(
+      offsetFactor: const Offset(-0.5, 0.25),
+      fallbackSize: const Size(800, 600),
+    );
+    final child = ContainerLayer();
+    layer.append(child);
+    final transform = Matrix4.identity();
+    layer.applyTransform(child, transform);
+    expect(transform, Matrix4.translationValues(-400, 150, 0));
+
+    layer.debugMarkClean();
+    layer.fallbackSize = const Size(1000, 400);
+    expect(layer.debugSubtreeNeedsAddToScene, isTrue);
+    transform.setIdentity();
+    layer.applyTransform(child, transform);
+    expect(transform, Matrix4.translationValues(-500, 100, 0));
+    layer.dispose();
+  });
+
   test('non-painted layers are detached', () {
     RenderObject boundary, inner;
     final root = RenderOpacity(

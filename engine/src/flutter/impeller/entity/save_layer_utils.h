@@ -9,9 +9,82 @@
 #include <optional>
 
 #include "impeller/entity/contents/filters/filter_contents.h"
+#include "impeller/geometry/color.h"
 #include "impeller/geometry/rect.h"
 
 namespace impeller {
+
+/// The semantic facts required to prove that a backdrop saveLayer can be
+/// evaluated directly in its parent color target.
+///
+/// This deliberately contains no backend resources. It is a logical-plan
+/// predicate: allocation and pass scheduling happen only after it succeeds.
+struct BackdropLayerDirectPlanInputs {
+  bool has_backdrop_filter = false;
+  bool content_is_single_sample_compatible = false;
+  bool content_bounds_are_contained = false;
+  bool is_root_pass = false;
+  BlendMode restore_blend_mode = BlendMode::kSrcOver;
+  bool restore_is_opaque = false;
+  bool restore_has_effects = false;
+  bool shares_backdrop_input = false;
+  Scalar inherited_opacity = 1.0f;
+};
+
+enum class BackdropLayerDirectRejection : uint32_t {
+  kMissingBackdropFilter = 1u << 0u,
+  kContentNeedsMultisampling = 1u << 1u,
+  kContentBoundsUncontained = 1u << 2u,
+  kNestedPass = 1u << 3u,
+  kRestoreBlendMode = 1u << 4u,
+  kRestoreNotOpaque = 1u << 5u,
+  kRestoreHasEffects = 1u << 6u,
+  kSharedBackdropInput = 1u << 7u,
+  kInheritedOpacity = 1u << 8u,
+};
+
+/// Returns a bitset explaining every failed direct-plan predicate. A zero
+/// result means the rewrite is accepted.
+uint32_t GetBackdropLayerDirectRejections(
+    const BackdropLayerDirectPlanInputs& inputs);
+
+/// Returns true when the following saveLayer expression is an exact rewrite:
+///
+///   layer = backdrop; layer = children over layer; parent = layer (kSrc)
+///
+/// as:
+///
+///   parent = backdrop (kSrc); parent = children over parent
+bool CanRenderBackdropLayerDirectly(
+    const BackdropLayerDirectPlanInputs& inputs);
+
+/// Backend and draw facts required to collapse the final direct-backdrop draw
+/// and its first external-surface child into one physical command.
+struct BackdropSurfaceCompositePlanInputs {
+  bool backend_supports_external_sampler = false;
+  bool backdrop_is_texture = false;
+  bool surface_is_external_texture = false;
+  bool surface_sampling_is_direct = false;
+  BlendMode surface_blend_mode = BlendMode::kSrcOver;
+  bool transforms_are_translation_scale = false;
+  bool surface_covers_backdrop_scope = false;
+};
+
+enum class BackdropSurfaceCompositeRejection : uint32_t {
+  kBackend = 1u << 0u,
+  kBackdropNotTexture = 1u << 1u,
+  kSurfaceNotExternalTexture = 1u << 2u,
+  kSurfaceSampling = 1u << 3u,
+  kSurfaceBlendMode = 1u << 4u,
+  kTransform = 1u << 5u,
+  kCoverage = 1u << 6u,
+};
+
+uint32_t GetBackdropSurfaceCompositeRejections(
+    const BackdropSurfaceCompositePlanInputs& inputs);
+
+bool CanRenderBackdropSurfaceComposite(
+    const BackdropSurfaceCompositePlanInputs& inputs);
 
 /// @brief Compute the coverage of a subpass in the global coordinate space.
 ///

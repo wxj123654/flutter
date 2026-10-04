@@ -36,8 +36,20 @@ void TextureContents::SetLabel(std::string_view label) {
   label_ = label;
 }
 
+void TextureContents::SetIsExternalTexture(bool is_external_texture) {
+  is_external_texture_ = is_external_texture;
+}
+
+bool TextureContents::IsExternalTexture() const {
+  return is_external_texture_;
+}
+
 void TextureContents::SetDestinationRect(Rect rect) {
   destination_rect_ = rect;
+}
+
+const Rect& TextureContents::GetDestinationRect() const {
+  return destination_rect_;
 }
 
 void TextureContents::SetTexture(std::shared_ptr<Texture> texture) {
@@ -125,15 +137,22 @@ bool TextureContents::Render(const ContentContext& renderer,
       Rect::MakeSize(texture_->GetSize()).Project(source_rect_);
   auto& data_host_buffer = renderer.GetTransientsDataBuffer();
 
+  const auto remap_uv = [&](Point uv) {
+    if (texture_->GetYCoordScale() < 0.0f) {
+      uv.y = 1.0f - uv.y;
+    }
+    return uv;
+  };
+
   std::array<VS::PerVertexData, 4> vertices = {
       VS::PerVertexData{destination_rect_.GetLeftTop(),
-                        texture_coords.GetLeftTop()},
+                        remap_uv(texture_coords.GetLeftTop())},
       VS::PerVertexData{destination_rect_.GetRightTop(),
-                        texture_coords.GetRightTop()},
+                        remap_uv(texture_coords.GetRightTop())},
       VS::PerVertexData{destination_rect_.GetLeftBottom(),
-                        texture_coords.GetLeftBottom()},
+                        remap_uv(texture_coords.GetLeftBottom())},
       VS::PerVertexData{destination_rect_.GetRightBottom(),
-                        texture_coords.GetRightBottom()},
+                        remap_uv(texture_coords.GetRightBottom())},
   };
   auto vertex_buffer = CreateVertexBuffer(vertices, data_host_buffer);
 
@@ -147,6 +166,19 @@ bool TextureContents::Render(const ContentContext& renderer,
     pass.SetCommandLabel("Texture Fill: " + label_);
   }
 #endif  // IMPELLER_DEBUG
+
+  if (label_ == "Denial backdrop cached composite") {
+    pass.SetCommandAuditCategory(
+        CommandAuditCategory::kBackdropCachedComposite);
+  } else if (label_ == "Denial backdrop layer restore") {
+    pass.SetCommandAuditCategory(CommandAuditCategory::kBackdropRestore);
+  } else if (label_ == "MSAA backdrop") {
+    pass.SetCommandAuditCategory(CommandAuditCategory::kMsaaBackdropRestore);
+  } else if (is_external_texture_) {
+    pass.SetCommandAuditCategory(CommandAuditCategory::kExternalTexture);
+  } else {
+    pass.SetCommandAuditCategory(CommandAuditCategory::kSceneTexture);
+  }
 
   auto pipeline_options = OptionsFromPassAndEntity(pass, entity);
   if (!stencil_enabled_) {
@@ -184,6 +216,13 @@ bool TextureContents::Render(const ContentContext& renderer,
         Rect::MakeSize(texture_->GetSize()).Project(source_rect_.Expand(-0.5));
 
     FSStrict::FragInfo frag_info;
+    if (texture_->GetYCoordScale() < 0.0f) {
+      strict_texture_coords =
+          Rect::MakeLTRB(strict_texture_coords.GetLeft(),
+                         1.0f - strict_texture_coords.GetBottom(),
+                         strict_texture_coords.GetRight(),
+                         1.0f - strict_texture_coords.GetTop());
+    }
     frag_info.source_rect = Vector4(strict_texture_coords.GetLTRB());
     frag_info.alpha = GetOpacity();
     FSStrict::BindFragInfo(pass, data_host_buffer.EmplaceUniform((frag_info)));

@@ -12,6 +12,8 @@ abstract class Scene {
 
 abstract class TransformEngineLayer implements EngineLayer {}
 
+abstract class OutputRelativeTransformEngineLayer implements EngineLayer {}
+
 abstract class OffsetEngineLayer implements EngineLayer {}
 
 abstract class ClipRectEngineLayer implements EngineLayer {}
@@ -37,6 +39,13 @@ abstract class SceneBuilder {
 
   OffsetEngineLayer pushOffset(double dx, double dy, {OffsetEngineLayer? oldLayer});
   TransformEngineLayer pushTransform(Float64List matrix4, {TransformEngineLayer? oldLayer});
+  OutputRelativeTransformEngineLayer pushOutputRelativeTransform(
+    double offsetFactorX,
+    double offsetFactorY,
+    double fallbackWidth,
+    double fallbackHeight, {
+    OutputRelativeTransformEngineLayer? oldLayer,
+  });
   ClipRectEngineLayer pushClipRect(
     Rect rect, {
     Clip clipBehavior = Clip.antiAlias,

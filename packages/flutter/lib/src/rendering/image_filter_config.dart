@@ -85,6 +85,17 @@ abstract class ImageFilterConfig {
   ///
   /// The `tileMode` argument determines how the blur should handle edges.
   ///
+  /// The `downsampleScale` argument controls the linear resolution of the
+  /// intermediate blur textures on Impeller. Values below 1.0 trade detail for
+  /// lower GPU cost while preserving the requested blur radius. It defaults to
+  /// 1.0 and must be between 0.0625 and 1.0, inclusive.
+  ///
+  /// When `backdropAlphaThreshold` is non-null, Denial's native compositor
+  /// applies a backdrop blur only where the final sampled child alpha is
+  /// strictly greater than this value. It must be between 0.0 and 1.0.
+  /// `backdropAlphaThresholdIsSingleSurface` is an optimization promise for a
+  /// child containing exactly one external surface.
+  ///
   /// The `bounded` argument (defaults to false) controls the sampling strategy:
   ///
   ///  * If false, the filter is applied to the entire canvas using standard
@@ -111,7 +122,42 @@ abstract class ImageFilterConfig {
     double sigmaY,
     ui.TileMode tileMode,
     bool bounded,
+    double downsampleScale,
+    double? backdropAlphaThreshold,
+    bool backdropAlphaThresholdIsSingleSurface,
   }) = _BlurImageFilterConfig;
+
+  /// Creates Denial's native shape-aware glass material.
+  ///
+  /// The material combines a Gaussian-frosted input with sharp refracted
+  /// samples, chromatic dispersion, accent tinting, and directional edge
+  /// lighting. Its rounded shape is resolved from the target's paint bounds.
+  const factory ImageFilterConfig.glass({
+    double sigmaX,
+    double sigmaY,
+    ui.Radius topLeft,
+    ui.Radius topRight,
+    ui.Radius bottomRight,
+    ui.Radius bottomLeft,
+    double downsampleScale,
+    double thickness,
+    double refraction,
+    double dispersion,
+    double saturation,
+    ui.Color tint,
+    double tintStrength,
+    double brightness,
+    double lightAngle,
+    double lightIntensity,
+    double edgeStrength,
+    double bevelWidthScale,
+    double refractionDepthScale,
+    double rimWidth,
+    double rimFalloff,
+    double oppositeLightStrength,
+    double? backdropAlphaThreshold,
+    bool backdropAlphaThresholdIsSingleSurface,
+  }) = _GlassImageFilterConfig;
 
   /// Composes the `inner` filter configuration with `outer`, to combine their
   /// effects.
@@ -186,12 +232,23 @@ class _BlurImageFilterConfig extends ImageFilterConfig {
     this.sigmaY = 0.0,
     this.tileMode = ui.TileMode.clamp,
     this.bounded = false,
-  }) : super._();
+    this.downsampleScale = 1.0,
+    this.backdropAlphaThreshold,
+    this.backdropAlphaThresholdIsSingleSurface = false,
+  }) : assert(downsampleScale >= 0.0625 && downsampleScale <= 1.0),
+       assert(
+         backdropAlphaThreshold == null ||
+             (backdropAlphaThreshold >= 0.0 && backdropAlphaThreshold <= 1.0),
+       ),
+       super._();
 
   final double sigmaX;
   final double sigmaY;
   final ui.TileMode tileMode;
   final bool bounded;
+  final double downsampleScale;
+  final double? backdropAlphaThreshold;
+  final bool backdropAlphaThresholdIsSingleSurface;
 
   @override
   ui.ImageFilter resolve(ImageFilterContext context) {
@@ -200,6 +257,9 @@ class _BlurImageFilterConfig extends ImageFilterConfig {
       sigmaY: sigmaY,
       tileMode: tileMode,
       bounds: bounded ? context.bounds : null,
+      downsampleScale: downsampleScale,
+      backdropAlphaThreshold: backdropAlphaThreshold,
+      backdropAlphaThresholdIsSingleSurface: backdropAlphaThresholdIsSingleSurface,
     );
   }
 
@@ -215,11 +275,22 @@ class _BlurImageFilterConfig extends ImageFilterConfig {
         other.sigmaX == sigmaX &&
         other.sigmaY == sigmaY &&
         other.tileMode == tileMode &&
-        other.bounded == bounded;
+        other.bounded == bounded &&
+        other.downsampleScale == downsampleScale &&
+        other.backdropAlphaThreshold == backdropAlphaThreshold &&
+        other.backdropAlphaThresholdIsSingleSurface == backdropAlphaThresholdIsSingleSurface;
   }
 
   @override
-  int get hashCode => Object.hash(sigmaX, sigmaY, tileMode, bounded);
+  int get hashCode => Object.hash(
+    sigmaX,
+    sigmaY,
+    tileMode,
+    bounded,
+    downsampleScale,
+    backdropAlphaThreshold,
+    backdropAlphaThresholdIsSingleSurface,
+  );
 
   String get _modeString {
     switch (tileMode) {
@@ -236,8 +307,176 @@ class _BlurImageFilterConfig extends ImageFilterConfig {
 
   String get _boundedString => bounded ? 'bounded' : 'unbounded';
 
+  String get _downsampleString => downsampleScale == 1.0 ? '' : ', downsample: $downsampleScale';
+
+  String get _backdropAlphaThresholdString =>
+      backdropAlphaThreshold == null ? '' : ', backdrop alpha threshold: $backdropAlphaThreshold';
+
   @override
-  String get debugShortDescription => 'blur($sigmaX, $sigmaY, $_modeString, $_boundedString)';
+  String get debugShortDescription =>
+      'blur($sigmaX, $sigmaY, $_modeString, $_boundedString$_downsampleString$_backdropAlphaThresholdString)';
+}
+
+class _GlassImageFilterConfig extends ImageFilterConfig {
+  const _GlassImageFilterConfig({
+    this.sigmaX = 14,
+    this.sigmaY = 14,
+    this.topLeft = ui.Radius.zero,
+    this.topRight = ui.Radius.zero,
+    this.bottomRight = ui.Radius.zero,
+    this.bottomLeft = ui.Radius.zero,
+    this.downsampleScale = 0.75,
+    this.thickness = 20,
+    this.refraction = 0.55,
+    this.dispersion = 0.12,
+    this.saturation = 1.2,
+    this.tint = const ui.Color(0xffffffff),
+    this.tintStrength = 0.08,
+    this.brightness = 0.06,
+    this.lightAngle = 3.9269908169872414,
+    this.lightIntensity = 0.7,
+    this.edgeStrength = 0.65,
+    this.bevelWidthScale = 1.0,
+    this.refractionDepthScale = 1.0,
+    this.rimWidth = 1.5,
+    this.rimFalloff = 0.89,
+    this.oppositeLightStrength = 0.8,
+    this.backdropAlphaThreshold,
+    this.backdropAlphaThresholdIsSingleSurface = false,
+  }) : assert(sigmaX >= 0 && sigmaY >= 0),
+       assert(downsampleScale >= 0.0625 && downsampleScale <= 1),
+       assert(thickness >= 0),
+       assert(refraction >= 0 && refraction <= 1),
+       assert(dispersion >= 0 && dispersion <= 1),
+       assert(saturation >= 0),
+       assert(tintStrength >= 0 && tintStrength <= 1),
+       assert(brightness >= -1 && brightness <= 1),
+       assert(lightIntensity >= 0),
+       assert(edgeStrength >= 0),
+       assert(
+         backdropAlphaThreshold == null ||
+             (backdropAlphaThreshold >= 0 && backdropAlphaThreshold <= 1),
+       ),
+       super._();
+
+  final double sigmaX;
+  final double sigmaY;
+  final ui.Radius topLeft;
+  final ui.Radius topRight;
+  final ui.Radius bottomRight;
+  final ui.Radius bottomLeft;
+  final double downsampleScale;
+  final double thickness;
+  final double refraction;
+  final double dispersion;
+  final double saturation;
+  final ui.Color tint;
+  final double tintStrength;
+  final double brightness;
+  final double lightAngle;
+  final double lightIntensity;
+  final double edgeStrength;
+  final double bevelWidthScale;
+  final double refractionDepthScale;
+  final double rimWidth;
+  final double rimFalloff;
+  final double oppositeLightStrength;
+  final double? backdropAlphaThreshold;
+  final bool backdropAlphaThresholdIsSingleSurface;
+
+  @override
+  ui.ImageFilter resolve(ImageFilterContext context) {
+    return ui.ImageFilter.glass(
+      sigmaX: sigmaX,
+      sigmaY: sigmaY,
+      shape: ui.RRect.fromRectAndCorners(
+        context.bounds,
+        topLeft: topLeft,
+        topRight: topRight,
+        bottomRight: bottomRight,
+        bottomLeft: bottomLeft,
+      ),
+      downsampleScale: downsampleScale,
+      thickness: thickness,
+      refraction: refraction,
+      dispersion: dispersion,
+      saturation: saturation,
+      tint: tint,
+      tintStrength: tintStrength,
+      brightness: brightness,
+      lightAngle: lightAngle,
+      lightIntensity: lightIntensity,
+      edgeStrength: edgeStrength,
+      bevelWidthScale: bevelWidthScale,
+      refractionDepthScale: refractionDepthScale,
+      rimWidth: rimWidth,
+      rimFalloff: rimFalloff,
+      oppositeLightStrength: oppositeLightStrength,
+      backdropAlphaThreshold: backdropAlphaThreshold,
+      backdropAlphaThresholdIsSingleSurface: backdropAlphaThresholdIsSingleSurface,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) {
+    return other is _GlassImageFilterConfig &&
+        other.sigmaX == sigmaX &&
+        other.sigmaY == sigmaY &&
+        other.topLeft == topLeft &&
+        other.topRight == topRight &&
+        other.bottomRight == bottomRight &&
+        other.bottomLeft == bottomLeft &&
+        other.downsampleScale == downsampleScale &&
+        other.thickness == thickness &&
+        other.refraction == refraction &&
+        other.dispersion == dispersion &&
+        other.saturation == saturation &&
+        other.tint == tint &&
+        other.tintStrength == tintStrength &&
+        other.brightness == brightness &&
+        other.lightAngle == lightAngle &&
+        other.lightIntensity == lightIntensity &&
+        other.edgeStrength == edgeStrength &&
+        other.bevelWidthScale == bevelWidthScale &&
+        other.refractionDepthScale == refractionDepthScale &&
+        other.rimWidth == rimWidth &&
+        other.rimFalloff == rimFalloff &&
+        other.oppositeLightStrength == oppositeLightStrength &&
+        other.backdropAlphaThreshold == backdropAlphaThreshold &&
+        other.backdropAlphaThresholdIsSingleSurface == backdropAlphaThresholdIsSingleSurface;
+  }
+
+  @override
+  int get hashCode => Object.hashAll(<Object?>[
+    sigmaX,
+    sigmaY,
+    topLeft,
+    topRight,
+    bottomRight,
+    bottomLeft,
+    downsampleScale,
+    thickness,
+    refraction,
+    dispersion,
+    saturation,
+    tint,
+    tintStrength,
+    brightness,
+    lightAngle,
+    lightIntensity,
+    edgeStrength,
+    bevelWidthScale,
+    refractionDepthScale,
+    rimWidth,
+    rimFalloff,
+    oppositeLightStrength,
+    backdropAlphaThreshold,
+    backdropAlphaThresholdIsSingleSurface,
+  ]);
+
+  @override
+  String get debugShortDescription =>
+      'glass($sigmaX, $sigmaY, thickness: $thickness, refraction: $refraction, dispersion: $dispersion)';
 }
 
 class _ComposeImageFilterConfig extends ImageFilterConfig {

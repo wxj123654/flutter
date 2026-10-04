@@ -15,8 +15,10 @@
 #include "flutter/display_list/effects/dl_image_filter.h"
 #include "flutter/display_list/geometry/dl_path.h"
 #include "impeller/core/sampler_descriptor.h"
+#include "impeller/display_list/backdrop_graph.h"
 #include "impeller/display_list/paint.h"
 #include "impeller/entity/contents/atlas_contents.h"
+#include "impeller/entity/contents/backdrop_surface_contents.h"
 #include "impeller/entity/contents/clip_contents.h"
 #include "impeller/entity/contents/solid_rrect_like_blur_contents.h"
 #include "impeller/entity/contents/text_contents.h"
@@ -41,11 +43,28 @@ namespace impeller {
 struct BackdropData {
   size_t backdrop_count = 0;
   bool all_filters_equal = true;
+  bool backdrop_count_consumed = false;
   std::shared_ptr<Texture> texture_slot;
   // A single snapshot of the backdrop filter that is used when there are
   // multiple backdrops that share an identical filter.
   std::optional<Snapshot> shared_filter_snapshot;
   std::shared_ptr<flutter::DlImageFilter> last_backdrop;
+};
+
+struct PendingBackdropComposite {
+  Entity fallback_entity;
+  std::shared_ptr<TextureContents> backdrop_contents;
+  std::optional<Snapshot> scene_snapshot;
+  std::optional<Scalar> alpha_threshold;
+  Rect coverage;
+  IRect32 scissor;
+};
+
+struct DeferredRRectClip {
+  ClipContents contents;
+  uint32_t clip_depth = 0u;
+  std::optional<IRect32> cover_scissor;
+  BackdropSurfaceContents::AnalyticRRect analytic_clip;
 };
 
 struct CanvasStackEntry {
@@ -61,6 +80,12 @@ struct CanvasStackEntry {
   // Whether subpass coverage was rounded out to pixel coverage, or if false
   // truncated.
   bool did_round_out = false;
+  // Root rounded clips and direct backdrops may wait for the first compatible
+  // external texture. The eventual physical plan either consumes both in one
+  // composite or flushes these exact fallback entities before any draw whose
+  // ordering depends on them.
+  std::shared_ptr<PendingBackdropComposite> pending_backdrop_composite;
+  std::shared_ptr<DeferredRRectClip> deferred_rrect_clip;
 };
 
 enum class PointStyle {
@@ -100,7 +125,8 @@ enum class ContentBoundsPromise {
 class LazyRenderingConfig {
  public:
   LazyRenderingConfig(ContentContext& renderer,
-                      std::unique_ptr<EntityPassTarget> p_entity_pass_target);
+                      std::unique_ptr<EntityPassTarget> p_entity_pass_target,
+                      bool preserve_depth_stencil_between_passes = false);
 
   LazyRenderingConfig(LazyRenderingConfig&&) = default;
 
@@ -142,7 +168,8 @@ class Canvas {
   /// @brief Update the backdrop data used to group together backdrop filters
   ///        within the same layer
   void SetBackdropData(std::unordered_map<int64_t, BackdropData> backdrop_data,
-                       size_t backdrop_count);
+                       size_t backdrop_count,
+                       BackdropEpochPlan backdrop_epoch_plan = {});
 
   /// @brief Return the culling bounds of the current render target, or nullopt
   ///        if there is no coverage.
@@ -157,7 +184,8 @@ class Canvas {
       ContentBoundsPromise bounds_promise = ContentBoundsPromise::kUnknown,
       uint32_t total_content_depth = kMaxDepth,
       bool can_distribute_opacity = false,
-      std::optional<int64_t> backdrop_id = std::nullopt);
+      std::optional<int64_t> backdrop_id = std::nullopt,
+      bool content_is_single_sample_compatible = false);
 
   bool Restore();
 
@@ -233,7 +261,8 @@ class Canvas {
       Rect dest,
       const Paint& paint,
       const SamplerDescriptor& sampler = {},
-      SourceRectConstraint src_rect_constraint = SourceRectConstraint::kFast);
+      SourceRectConstraint src_rect_constraint = SourceRectConstraint::kFast,
+      bool is_external_texture = false);
 
   void DrawTextFrame(const std::shared_ptr<TextFrame>& text_frame,
                      Point position,
@@ -248,7 +277,9 @@ class Canvas {
 
   void ClipGeometry(const Geometry& geometry,
                     Entity::ClipOperation clip_op,
-                    bool is_aa = true);
+                    bool is_aa = true,
+                    std::optional<BackdropSurfaceContents::AnalyticRRect>
+                        analytic_round_rect = std::nullopt);
 
   void EndReplay();
 
@@ -257,8 +288,19 @@ class Canvas {
   uint64_t GetMaxOpDepth() const { return transform_stack_.back().clip_depth; }
 
   struct SaveLayerState {
+    struct AlphaThresholdBackdrop {
+      Entity entity;
+      std::shared_ptr<TextureContents> contents;
+      Scalar threshold = 0.0f;
+    };
+
     Paint paint;
     Rect coverage;
+    bool has_backdrop_filter = false;
+    std::optional<AlphaThresholdBackdrop> alpha_threshold_backdrop;
+    // A pooled target may include unused padding. Restore only the original
+    // pixel region so allocation granularity cannot expand the visible layer.
+    std::optional<ISize> texture_region;
   };
 
   // Visible for testing.
@@ -284,6 +326,22 @@ class Canvas {
   static bool IsCompatibleWithSDFRendering(const Paint& paint);
 
  private:
+  std::shared_ptr<PendingBackdropComposite>* FindPendingBackdropComposite();
+
+  std::shared_ptr<DeferredRRectClip>* FindDeferredRRectClip();
+
+  void FlushDeferredRRectClip();
+
+  void FlushPendingBackdropComposite();
+
+  bool TryBackdropSurfaceComposite(
+      Entity& surface_entity,
+      const std::shared_ptr<TextureContents>& surface_contents);
+
+  std::optional<uint32_t> ClaimBackdropEpoch(
+      const Rect& write_region,
+      const flutter::DlImageFilter& backdrop_filter);
+
   class BlurShape {
    public:
     virtual ~BlurShape() = default;
@@ -313,6 +371,14 @@ class Canvas {
   /// all backdrop filters will have an identified backdrop id. The
   /// backdrop_count_ is also mutated during rendering.
   std::unordered_map<int64_t, BackdropData> backdrop_data_;
+
+  /// Region-sensitive scene-color dependencies collected before rendering.
+  /// Physical scheduling may consume this without rediscovering relationships
+  /// from already-lowered entities.
+  BackdropEpochPlan backdrop_epoch_plan_;
+  BackdropEpochCursor backdrop_epoch_cursor_;
+  std::optional<uint32_t> active_backdrop_epoch_;
+  std::shared_ptr<Texture> active_backdrop_epoch_texture_;
 
   /// The remaining number of backdrop filters.
   ///
@@ -397,7 +463,10 @@ class Canvas {
       bool reuse_depth = false,
       const std::optional<Matrix>& shape_transform = std::nullopt);
 
-  void AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth = false);
+  void AddRenderEntityToCurrentPass(
+      Entity& entity,
+      bool reuse_depth = false,
+      std::shared_ptr<TextureContents> texture_contents = nullptr);
 
   /// Returns true if this operation is consistent with a DrawShadow-like
   /// operation.

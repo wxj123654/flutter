@@ -31,6 +31,8 @@
 #include "impeller/entity/framebuffer_blend.frag.h"
 #include "impeller/entity/framebuffer_blend.vert.h"
 #include "impeller/entity/gaussian.frag.h"
+#include "impeller/entity/glass.frag.h"
+#include "impeller/entity/glass.vert.h"
 #include "impeller/entity/glyph_atlas.frag.h"
 #include "impeller/entity/glyph_atlas.vert.h"
 #include "impeller/entity/gradient_fill.vert.h"
@@ -71,6 +73,9 @@
 #include "impeller/renderer/pipeline.h"
 
 #ifdef IMPELLER_ENABLE_OPENGLES
+#include "impeller/entity/backdrop_surface_composite.frag.h"
+#include "impeller/entity/backdrop_surface_composite.vert.h"
+#include "impeller/entity/backdrop_surface_composite_texture.frag.h"
 #include "impeller/entity/texture_downsample_gles.frag.h"
 #include "impeller/entity/tiled_texture_fill_external.frag.h"
 #endif  // IMPELLER_ENABLE_OPENGLES
@@ -136,6 +141,7 @@ using FramebufferBlendSaturationPipeline = FramebufferBlendPipelineHandle;
 using FramebufferBlendScreenPipeline = FramebufferBlendPipelineHandle;
 using FramebufferBlendSoftLightPipeline = FramebufferBlendPipelineHandle;
 using GaussianBlurPipeline = RenderPipelineHandle<FilterPositionUvVertexShader, GaussianFragmentShader>;
+using GlassPipeline = RenderPipelineHandle<GlassVertexShader, GlassFragmentShader>;
 using GlyphAtlasPipeline = RenderPipelineHandle<GlyphAtlasVertexShader, GlyphAtlasFragmentShader>;
 using LinePipeline = RenderPipelineHandle<LineVertexShader, LineFragmentShader>;
 using LinearGradientFillPipeline = GradientPipelineHandle<LinearGradientFillFragmentShader>;
@@ -171,6 +177,12 @@ using YUVToRGBFilterPipeline = RenderPipelineHandle<FilterPositionVertexShader, 
 
 // Web doesn't support external texture OpenGL extensions
 #if !defined(FML_OS_EMSCRIPTEN)
+using BackdropSurfaceCompositePipeline =
+    RenderPipelineHandle<BackdropSurfaceCompositeVertexShader,
+                         BackdropSurfaceCompositeFragmentShader>;
+using BackdropSurfaceCompositeTexturePipeline =
+    RenderPipelineHandle<BackdropSurfaceCompositeVertexShader,
+                         BackdropSurfaceCompositeTextureFragmentShader>;
 using TiledTextureExternalPipeline =
     RenderPipelineHandle<TextureFillVertexShader,
                          TiledTextureFillExternalFragmentShader>;

@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <memory>
+#include <unordered_map>
 
 #include "flutter/common/graphics/gl_context_switch.h"
 #include "flutter/flow/embedded_views.h"
@@ -17,6 +18,7 @@
 
 #include "third_party/skia/include/core/SkSurface.h"
 #include "third_party/skia/include/gpu/ganesh/GrDirectContext.h"
+#include "third_party/skia/include/gpu/ganesh/gl/GrGLInterface.h"
 
 namespace flutter {
 
@@ -24,12 +26,15 @@ class GPUSurfaceGLSkia : public Surface {
  public:
   static sk_sp<GrDirectContext> MakeGLContext(GPUSurfaceGLDelegate* delegate);
 
-  GPUSurfaceGLSkia(GPUSurfaceGLDelegate* delegate, bool render_to_surface);
+  GPUSurfaceGLSkia(GPUSurfaceGLDelegate* delegate,
+                   bool render_to_surface,
+                   bool forward_external_view_damage = false);
 
   // Creates a new GL surface reusing an existing GrDirectContext.
   GPUSurfaceGLSkia(const sk_sp<GrDirectContext>& gr_context,
                    GPUSurfaceGLDelegate* delegate,
-                   bool render_to_surface);
+                   bool render_to_surface,
+                   bool forward_external_view_damage = false);
 
   // |Surface|
   ~GPUSurfaceGLSkia() override;
@@ -58,27 +63,38 @@ class GPUSurfaceGLSkia : public Surface {
  private:
   bool CreateOrUpdateSurfaces(const DlISize& size);
 
+  bool SelectOrCreateOnscreenSurface(const DlISize& size,
+                                     const GLFBOInfo& fbo_info);
+
   sk_sp<SkSurface> AcquireRenderSurface(
       const DlISize& untransformed_size,
       const DlMatrix& root_surface_transformation);
 
   bool PresentSurface(const SurfaceFrame& frame);
 
+  bool PresentExternalViewDamage(const SurfaceFrame& frame);
+
   GPUSurfaceGLDelegate* delegate_;
   sk_sp<GrDirectContext> context_;
+  sk_sp<const GrGLInterface> gl_interface_;
   sk_sp<SkSurface> onscreen_surface_;
+  // Denial's embedder FBOs form a stable pool for the lifetime of this
+  // surface. Keep their SkSurface wrappers alive so rotating the scanout
+  // target does not repeatedly destroy and recreate stencil/DMSAA resources.
+  std::unordered_map<uint32_t, sk_sp<SkSurface>> onscreen_surfaces_;
   /// FBO backing the current `onscreen_surface_`.
   uint32_t fbo_id_ = 0;
   // The current FBO's existing damage, as tracked by the GPU surface, delegates
   // still have an option of overriding this damage with their own in
   // `GLContextFrameBufferInfo`.
-  std::optional<DlIRect> existing_damage_ = std::nullopt;
+  std::optional<DlRegion> existing_damage_ = std::nullopt;
   bool context_owner_ = false;
   // TODO(38466): Refactor GPU surface APIs take into account the fact that an
   // external view embedder may want to render to the root surface. This is a
   // hack to make avoid allocating resources for the root surface when an
   // external view embedder is present.
   const bool render_to_surface_ = true;
+  const bool forward_external_view_damage_ = false;
   bool valid_ = false;
 
   // WeakPtrFactory must be the last member.

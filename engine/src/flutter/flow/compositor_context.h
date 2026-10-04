@@ -6,7 +6,9 @@
 #define FLUTTER_FLOW_COMPOSITOR_CONTEXT_H_
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_set>
 
 #include "flutter/common/graphics/texture.h"
 #include "flutter/common/macros.h"
@@ -17,6 +19,10 @@
 #include "flutter/fml/macros.h"
 #include "flutter/fml/raster_thread_merger.h"
 #include "third_party/skia/include/gpu/ganesh/GrDirectContext.h"
+
+namespace impeller {
+class BackdropSnapshotPins;
+}  // namespace impeller
 
 namespace flutter {
 
@@ -46,6 +52,34 @@ enum class RasterStatus {
   kSkipAndRetry,
 };
 
+// Controls whether a frame may use the damage region calculated from the
+// layer-tree diff and the selected framebuffer's repair history.
+enum class RasterDamagePolicy {
+  kUseDamageRegion,
+  kFullRepaint,
+};
+
+// Identifies the raster backend capabilities that affect damage planning.
+enum class RasterBackend {
+  kSkiaGanesh,
+  kSkiaSoftware,
+  kImpeller,
+};
+
+// Separates exact logical damage from the region that is economical for the
+// selected raster backend to paint. A null repaint_region means that the
+// entire target will be repainted. buffer_damage always describes the pixels
+// the selected plan may modify.
+struct RasterDamagePlan {
+  static RasterDamagePlan Make(const std::optional<DlRegion>& damage,
+                               DlISize layer_tree_size,
+                               RasterDamagePolicy damage_policy,
+                               RasterBackend backend);
+
+  std::optional<DlRegion> repaint_region;
+  DlRegion buffer_damage;
+};
+
 class FrameDamage {
  public:
   // Sets previous layer tree for calculating frame damage. If not set, entire
@@ -54,52 +88,60 @@ class FrameDamage {
     prev_layer_tree_ = prev_layer_tree;
   }
 
-  // Adds additional damage (accumulated for double / triple buffering).
-  // This is area that will be repainted alongside any changed part.
-  void AddAdditionalDamage(const DlIRect& damage) {
-    additional_damage_ = additional_damage_.Union(damage);
+  // Limits autonomous reused-tree damage to the external textures that
+  // actually requested the frame. A null pointer preserves normal Flutter
+  // diffing, where every TextureLayer remains conservatively dirty.
+  void SetDirtyTextureIds(
+      const std::unordered_set<int64_t>* dirty_texture_ids) {
+    dirty_texture_ids_ = dirty_texture_ids;
   }
 
-  // Specifies clip rect alignment.
+  // Sets damage accumulated for the selected framebuffer by its embedder.
+  // nullopt means that the buffer contents are unknown and must be repainted
+  // completely. An empty region means that the buffer already represents the
+  // current front buffer.
+  void SetExistingDamage(std::optional<DlRegion> damage) {
+    existing_damage_ = std::move(damage);
+  }
+
+  // Specifies damage rectangle alignment.
   void SetClipAlignment(int horizontal, int vertical) {
     horizontal_clip_alignment_ = horizontal;
     vertical_clip_alignment_ = vertical;
   }
 
-  // Calculates clip rect for current rasterization. This is diff of layer tree
-  // and previous layer tree + any additional provided damage.
-  // If previous layer tree is not specified, clip rect will be nullopt,
-  // but the paint region of layer_tree will be calculated so that it can be
-  // used for diffing of subsequent frames.
-  std::optional<DlRect> ComputeClipRect(flutter::LayerTree& layer_tree,
-                                        bool has_raster_cache,
-                                        bool impeller_enabled);
+  // Calculates current frame damage and the repair region for the selected
+  // framebuffer. If the previous layer tree is not specified, the entire frame
+  // is considered changed, but its paint regions are still recorded for
+  // subsequent diffs.
+  std::optional<DlRegion> ComputeDamageRegion(
+      flutter::LayerTree& layer_tree,
+      bool has_raster_cache,
+      bool impeller_enabled,
+      const BackdropSnapshotPin& pin_backdrop = {});
 
   // See Damage::frame_damage.
-  std::optional<DlIRect> GetFrameDamage() const {
+  std::optional<DlRegion> GetFrameDamage() const {
     return damage_ ? std::make_optional(damage_->frame_damage) : std::nullopt;
   }
 
   // See Damage::buffer_damage.
-  std::optional<DlIRect> GetBufferDamage() {
-    return (damage_ && !ignore_damage_)
-               ? std::make_optional(damage_->buffer_damage)
-               : std::nullopt;
+  std::optional<DlRegion> GetBufferDamage() const {
+    return damage_ ? std::make_optional(damage_->buffer_damage) : std::nullopt;
   }
 
-  // Remove reported buffer_damage to inform clients that a partial repaint
-  // should not be performed on this frame.
-  // frame_damage is required to correctly track accumulated damage for
-  // subsequent frames.
-  void Reset() { ignore_damage_ = true; }
+  // Records the conservative region selected for rasterization. Frame damage
+  // remains precise for output routing and accumulation by other framebuffer
+  // slots.
+  void SetBufferDamage(DlRegion buffer_damage);
 
  private:
-  DlIRect additional_damage_;
+  std::optional<DlRegion> existing_damage_ = std::nullopt;
   std::optional<Damage> damage_;
   const LayerTree* prev_layer_tree_ = nullptr;
+  const std::unordered_set<int64_t>* dirty_texture_ids_ = nullptr;
   int vertical_clip_alignment_ = 1;
   int horizontal_clip_alignment_ = 1;
-  bool ignore_damage_ = false;
 };
 
 class CompositorContext {
@@ -136,22 +178,27 @@ class CompositorContext {
 
     virtual RasterStatus Raster(LayerTree& layer_tree,
                                 bool ignore_raster_cache,
-                                FrameDamage* frame_damage);
+                                FrameDamage* frame_damage,
+                                RasterDamagePolicy damage_policy =
+                                    RasterDamagePolicy::kUseDamageRegion);
 
    private:
     void PaintLayerTreeSkia(flutter::LayerTree& layer_tree,
-                            std::optional<DlRect> clip_rect,
+                            const std::optional<DlRegion>& clip_region,
                             bool needs_save_layer,
                             bool ignore_raster_cache);
 
     void PaintLayerTreeImpeller(flutter::LayerTree& layer_tree,
-                                std::optional<DlRect> clip_rect,
+                                const std::optional<DlRegion>& clip_region,
                                 bool ignore_raster_cache);
 
     CompositorContext& context_;
     GrDirectContext* gr_context_;
     DlCanvas* canvas_;
     impeller::AiksContext* aiks_context_;
+#ifdef IMPELLER_SUPPORTS_RENDERING
+    std::unique_ptr<impeller::BackdropSnapshotPins> backdrop_snapshot_pins_;
+#endif
     ExternalViewEmbedder* view_embedder_;
     const DlMatrix root_surface_transformation_;
     const bool instrumentation_enabled_;
@@ -205,12 +252,6 @@ class CompositorContext {
   void BeginFrame(ScopedFrame& frame, bool enable_instrumentation);
 
   void EndFrame(ScopedFrame& frame, bool enable_instrumentation);
-
-  /// @brief  Whether Impeller shouild attempt a partial repaint.
-  ///         The Impeller backend requires an additional blit pass, which may
-  ///         not be worthwhile if the damage region is large.
-  static bool ShouldPerformPartialRepaint(std::optional<DlRect> damage_rect,
-                                          DlISize layer_tree_size);
 
   FML_DISALLOW_COPY_AND_ASSIGN(CompositorContext);
 };

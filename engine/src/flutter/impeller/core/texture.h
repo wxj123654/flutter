@@ -46,6 +46,10 @@ class Texture {
 
   bool IsOpaque() const;
 
+  // Owned GLES offscreen targets are normalized by the vertex flip. A borrowed
+  // native FBO retains the embedder origin and needs sampling correction.
+  virtual Scalar GetYCoordScale() const { return 1.0f; }
+
   size_t GetMipCount() const;
 
   const TextureDescriptor& GetTextureDescriptor() const;

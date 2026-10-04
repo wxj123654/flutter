@@ -254,12 +254,77 @@ TEST(GaussianBlurFilterContentsTest, CalculateSigmaValues) {
   EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(2.0f), 1);
   EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(3.0f), 1);
   EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(4.0f), 1);
-  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(16.0f), 0.25);
+  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(6.0f), 0.25);
+  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(16.0f), 0.125);
   // Hang on to 1/8 as long as possible.
   EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(95.0f), 0.125);
   EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(96.0f), 0.0625);
   // Downsample clamped to 1/16th.
   EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(1024.0f), 0.0625);
+  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(4.0f, 0.5f), 0.5);
+  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(6.0f, 0.5f), 0.125);
+  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(16.0f, 0.5f), 0.0625);
+  EXPECT_EQ(GaussianBlurFilterContents::CalculateScale(1024.0f, 0.5f), 0.0625);
+}
+
+TEST_P(GaussianBlurFilterContentsTest,
+       ClampedCoverageCrossingTextureEdgesUsesTightTargets) {
+  constexpr Scalar kSigma = 6.0f;
+  std::shared_ptr<Texture> texture = MakeTexture(ISize(100, 80));
+  ASSERT_TRUE(texture);
+
+  auto contents = std::make_unique<GaussianBlurFilterContents>(
+      kSigma, kSigma, Entity::TileMode::kClamp,
+      /*bounds=*/std::nullopt, FilterContents::BlurStyle::kNormal,
+      /*mask_geometry=*/nullptr);
+  contents->SetInputs({FilterInput::Make(texture)});
+
+  const std::array<Rect, 4> local_coverage_hints = {
+      Rect::MakeXYWH(1, 1, 20, 20),
+      Rect::MakeXYWH(79, 1, 20, 20),
+      Rect::MakeXYWH(1, 59, 20, 20),
+      Rect::MakeXYWH(79, 59, 20, 20),
+  };
+  const std::array<Matrix, 2> transforms = {
+      Matrix(), Matrix::MakeTranslation({40, 30, 0})};
+
+  for (const Matrix& transform : transforms) {
+    Entity entity;
+    entity.SetTransform(transform);
+    for (const Rect& local_coverage_hint : local_coverage_hints) {
+      Rect coverage_hint = local_coverage_hint.TransformBounds(transform);
+      std::optional<Entity> result =
+          contents->GetEntity(*GetContentContext(), entity, coverage_hint);
+      ASSERT_TRUE(result.has_value());
+      auto texture_contents =
+          std::static_pointer_cast<TextureContents>(result->GetContents());
+      ASSERT_TRUE(texture_contents);
+      EXPECT_EQ(texture_contents->GetTexture()->GetSize(), ISize(11, 11));
+    }
+  }
+}
+
+TEST_P(GaussianBlurFilterContentsTest,
+       NonClampCoverageCrossingTextureEdgeUsesGenericTarget) {
+  constexpr Scalar kSigma = 6.0f;
+  std::shared_ptr<Texture> texture = MakeTexture(ISize(100, 80));
+  ASSERT_TRUE(texture);
+
+  auto contents = std::make_unique<GaussianBlurFilterContents>(
+      kSigma, kSigma, Entity::TileMode::kDecal,
+      /*bounds=*/std::nullopt, FilterContents::BlurStyle::kNormal,
+      /*mask_geometry=*/nullptr);
+  contents->SetInputs({FilterInput::Make(texture)});
+
+  Entity entity;
+  entity.SetTransform(Matrix::MakeTranslation({40, 30, 0}));
+  std::optional<Entity> result = contents->GetEntity(
+      *GetContentContext(), entity, Rect::MakeXYWH(42, 32, 20, 20));
+  ASSERT_TRUE(result.has_value());
+  auto texture_contents =
+      std::static_pointer_cast<TextureContents>(result->GetContents());
+  ASSERT_TRUE(texture_contents);
+  EXPECT_EQ(texture_contents->GetTexture()->GetSize(), ISize(30, 25));
 }
 
 TEST_P(GaussianBlurFilterContentsTest, RenderCoverageMatchesGetCoverage) {

@@ -4,6 +4,8 @@
 
 #include "flutter/flow/layers/texture_layer.h"
 
+#include <unordered_set>
+
 #include "flutter/flow/testing/diff_context_test.h"
 #include "flutter/flow/testing/layer_test.h"
 #include "flutter/flow/testing/mock_layer.h"
@@ -108,10 +110,32 @@ TEST_F(TextureLayerDiffTest, TextureInRetainedLayer) {
   tree2.root()->Add(container);  // retained layer
 
   auto damage = DiffLayerTree(tree1, MockLayerTree());
-  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
+  EXPECT_EQ(damage.frame_damage.bounds(), DlIRect::MakeLTRB(0, 0, 100, 100));
 
   damage = DiffLayerTree(tree2, tree1);
-  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
+  EXPECT_EQ(damage.frame_damage.bounds(), DlIRect::MakeLTRB(0, 0, 100, 100));
+
+  // Autonomous texture frames reuse the exact same LayerTree instance.
+  damage = DiffLayerTree(tree2, tree2);
+  EXPECT_EQ(damage.frame_damage.bounds(), DlIRect::MakeLTRB(0, 0, 100, 100));
+}
+
+TEST_F(TextureLayerDiffTest, AutonomousFrameDamagesOnlyMarkedTextures) {
+  MockLayerTree tree;
+  auto container = std::make_shared<ContainerLayer>();
+  tree.root()->Add(container);
+  container->Add(std::make_shared<TextureLayer>(
+      DlPoint(), DlSize(100, 100), 1, false, DlImageSampling::kLinear));
+  container->Add(std::make_shared<TextureLayer>(
+      DlPoint(200, 0), DlSize(100, 100), 2, false, DlImageSampling::kLinear));
+
+  auto damage = DiffLayerTree(tree, MockLayerTree());
+  EXPECT_EQ(damage.frame_damage.bounds(), DlIRect::MakeLTRB(0, 0, 300, 100));
+
+  const std::unordered_set<int64_t> dirty_texture_ids = {2};
+  damage = DiffLayerTree(tree, tree, DlIRect(), 0, 0, true, false,
+                         &dirty_texture_ids);
+  EXPECT_EQ(damage.frame_damage.bounds(), DlIRect::MakeLTRB(200, 0, 300, 100));
 }
 
 TEST_F(TextureLayerTest, OpacityInheritance) {

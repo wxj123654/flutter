@@ -6,6 +6,7 @@
 #define FML_USED_ON_EMBEDDER
 
 #include <atomic>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "flutter/fml/thread.h"
 #include "flutter/lib/ui/painting/image.h"
 #include "flutter/runtime/dart_vm.h"
+#include "flutter/shell/platform/embedder/embedder_external_view_embedder.h"
+#include "flutter/shell/platform/embedder/embedder_render_target.h"
 #include "flutter/shell/platform/embedder/embedder_surface_gl_impeller.h"
 #include "flutter/shell/platform/embedder/tests/embedder_assertions.h"
 #include "flutter/shell/platform/embedder/tests/embedder_config_builder.h"
@@ -40,9 +43,44 @@
 // CREATE_NATIVE_ENTRY is leaky by design
 // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
 
+namespace flutter {
+
+class EmbedderExternalViewEmbedderTestPeer {
+ public:
+  static void Prepare(EmbedderExternalViewEmbedder& embedder,
+                      int64_t view_id,
+                      DlISize frame_size) {
+    embedder.PrepareFlutterView(view_id, frame_size, 1.0);
+  }
+};
+
+}  // namespace flutter
+
 namespace flutter::testing {
 
 using EmbedderTest = testing::EmbedderTest;
+
+namespace {
+
+class DamageTestRenderTarget final : public EmbedderRenderTarget {
+ public:
+  DamageTestRenderTarget(FlutterBackingStore backing_store, DlISize size)
+      : EmbedderRenderTarget(backing_store, nullptr), size_(size) {}
+
+  sk_sp<SkSurface> GetSkiaSurface() const override { return nullptr; }
+  impeller::RenderTarget* GetImpellerRenderTarget() const override {
+    return nullptr;
+  }
+  std::shared_ptr<impeller::AiksContext> GetAiksContext() const override {
+    return nullptr;
+  }
+  DlISize GetRenderTargetSize() const override { return size_; }
+
+ private:
+  DlISize size_;
+};
+
+}  // namespace
 
 TEST_F(EmbedderTest, CanCreateOpenGLRenderingEngine) {
   auto& context = GetEmbedderContext<EmbedderTestContextGL>();
@@ -50,6 +88,77 @@ TEST_F(EmbedderTest, CanCreateOpenGLRenderingEngine) {
   builder.SetSurface(DlISize(1, 1));
   auto engine = builder.LaunchEngine();
   ASSERT_TRUE(engine.is_valid());
+}
+
+TEST(EmbedderExternalViewEmbedderTest,
+     DenialRenderViewsUseTheirOwnHeightForOpenGLOriginConversion) {
+  EmbedderExternalViewEmbedder embedder(
+      true,
+      [](GrDirectContext*, const std::shared_ptr<impeller::AiksContext>&,
+         const FlutterBackingStoreConfig&) {
+        return std::unique_ptr<EmbedderRenderTarget>();
+      },
+      [](FlutterViewId, const std::vector<const FlutterLayer*>&) {
+        return true;
+      });
+  ExternalViewEmbedder& root_embedder = embedder;
+  const DlMatrix implicit_transform =
+      DlMatrix::MakeTranslation({12.0f, 34.0f, 0.0f});
+  embedder.SetSurfaceTransformationCallback(
+      [implicit_transform] { return implicit_transform; });
+
+  EmbedderExternalViewEmbedderTestPeer::Prepare(embedder, 0,
+                                                DlISize(1600, 900));
+  EXPECT_EQ(root_embedder.GetRootCanvasToRenderTargetTransform(),
+            implicit_transform);
+
+  EmbedderExternalViewEmbedderTestPeer::Prepare(embedder, -1,
+                                                DlISize(800, 600));
+  auto transform = root_embedder.GetRootCanvasToRenderTargetTransform().value();
+  EXPECT_EQ(transform * DlPoint(0, 0), DlPoint(0, 600));
+  EXPECT_EQ(transform * DlPoint(800, 600), DlPoint(800, 0));
+
+  EmbedderExternalViewEmbedderTestPeer::Prepare(embedder, -2,
+                                                DlISize(1200, 900));
+  transform = root_embedder.GetRootCanvasToRenderTargetTransform().value();
+  EXPECT_EQ(transform * DlPoint(0, 0), DlPoint(0, 900));
+  EXPECT_EQ(transform * DlPoint(1200, 900), DlPoint(1200, 0));
+}
+
+TEST(EmbedderExternalViewEmbedderTest,
+     DenialSelectsBackingStoreBeforeReadingItsRepairDamage) {
+  const DlISize size(800, 600);
+  FlutterBackingStore backing_store = {};
+  backing_store.struct_size = sizeof(backing_store);
+  backing_store.type = kFlutterBackingStoreTypeOpenGL;
+  backing_store.open_gl.type = kFlutterOpenGLTargetTypeFramebuffer;
+  backing_store.open_gl.framebuffer.name = 73u;
+
+  EmbedderExternalViewEmbedder embedder(
+      true,
+      [backing_store, size](GrDirectContext*,
+                            const std::shared_ptr<impeller::AiksContext>&,
+                            const FlutterBackingStoreConfig& config) {
+        EXPECT_EQ(config.view_id, -1);
+        EXPECT_EQ(config.size.width, size.width);
+        EXPECT_EQ(config.size.height, size.height);
+        return std::make_unique<DamageTestRenderTarget>(backing_store, size);
+      },
+      [](FlutterViewId, const std::vector<const FlutterLayer*>&) {
+        return true;
+      });
+  const DlRegion expected_damage(DlIRect::MakeLTRB(4, 5, 20, 16));
+  embedder.SetExistingDamageCallback([&](intptr_t framebuffer) {
+    EXPECT_EQ(framebuffer, 73);
+    return std::make_optional(expected_damage);
+  });
+
+  EmbedderExternalViewEmbedderTestPeer::Prepare(embedder, -1, size);
+  auto prepared = embedder.PrepareDenialRenderTarget(-1, nullptr, nullptr);
+
+  ASSERT_TRUE(prepared.has_value());
+  ASSERT_TRUE(prepared->existing_damage.has_value());
+  EXPECT_EQ(prepared->existing_damage->getRects(), expected_damage.getRects());
 }
 
 //------------------------------------------------------------------------------
@@ -3751,14 +3860,10 @@ TEST_F(EmbedderTest,
   // be empty but, because there was a full existing buffer damage, the buffer
   // damage should be the entire screen.
   context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
-    const size_t num_rects = 1;
-    ASSERT_EQ(present_info.frame_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.frame_damage.damage->left, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->top, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->right, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->bottom, 0);
+    ASSERT_EQ(present_info.frame_damage.num_rects, 0u);
+    ASSERT_EQ(present_info.frame_damage.damage, nullptr);
 
-    ASSERT_EQ(present_info.buffer_damage.num_rects, num_rects);
+    ASSERT_EQ(present_info.buffer_damage.num_rects, 1u);
     ASSERT_EQ(present_info.buffer_damage.damage->left, 0);
     ASSERT_EQ(present_info.buffer_damage.damage->top, 0);
     ASSERT_EQ(present_info.buffer_damage.damage->right, 800);
@@ -3783,12 +3888,8 @@ TEST_F(EmbedderTest, PresentInfoReceivesEmptyDamage) {
   // Return no existing damage on purpose.
   context.SetGLPopulateExistingDamageCallback(
       [](const intptr_t id, FlutterDamage* existing_damage_ptr) {
-        const size_t num_rects = 1;
-        // The array must be valid after the callback returns.
-        static FlutterRect existing_damage_rects[num_rects] = {
-            FlutterRect{0, 0, 0, 0}};
-        existing_damage_ptr->num_rects = num_rects;
-        existing_damage_ptr->damage = existing_damage_rects;
+        existing_damage_ptr->num_rects = 0;
+        existing_damage_ptr->damage = nullptr;
       });
 
   EmbedderConfigBuilder builder(context);
@@ -3830,18 +3931,10 @@ TEST_F(EmbedderTest, PresentInfoReceivesEmptyDamage) {
   // Because it's the same as the first frame, the second frame should not be
   // rerendered assuming there is no existing damage.
   context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
-    const size_t num_rects = 1;
-    ASSERT_EQ(present_info.frame_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.frame_damage.damage->left, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->top, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->right, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->bottom, 0);
-
-    ASSERT_EQ(present_info.buffer_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.buffer_damage.damage->left, 0);
-    ASSERT_EQ(present_info.buffer_damage.damage->top, 0);
-    ASSERT_EQ(present_info.buffer_damage.damage->right, 0);
-    ASSERT_EQ(present_info.buffer_damage.damage->bottom, 0);
+    ASSERT_EQ(present_info.frame_damage.num_rects, 0u);
+    ASSERT_EQ(present_info.frame_damage.damage, nullptr);
+    ASSERT_EQ(present_info.buffer_damage.num_rects, 0u);
+    ASSERT_EQ(present_info.buffer_damage.damage, nullptr);
 
     latch.Signal();
   });
@@ -3910,14 +4003,10 @@ TEST_F(EmbedderTest, PresentInfoReceivesPartialDamage) {
   // empty but, because there was a partial existing damage, the buffer damage
   // should represent that partial damage area.
   context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
-    const size_t num_rects = 1;
-    ASSERT_EQ(present_info.frame_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.frame_damage.damage->left, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->top, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->right, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->bottom, 0);
+    ASSERT_EQ(present_info.frame_damage.num_rects, 0u);
+    ASSERT_EQ(present_info.frame_damage.damage, nullptr);
 
-    ASSERT_EQ(present_info.buffer_damage.num_rects, num_rects);
+    ASSERT_EQ(present_info.buffer_damage.num_rects, 1u);
     ASSERT_EQ(present_info.buffer_damage.damage->left, 200);
     ASSERT_EQ(present_info.buffer_damage.damage->top, 150);
     ASSERT_EQ(present_info.buffer_damage.damage->right, 400);
@@ -4579,6 +4668,7 @@ TEST_F(EmbedderTest, ExternalTextureGLRefreshedTooOften) {
   glGenTextures(1, &name);
 
   bool resolve_called = false;
+  int gl_state_query_count = 0;
 
   EmbedderExternalTextureGL::ExternalTextureCallback callback(
       [&](int64_t, size_t, size_t) {
@@ -4592,7 +4682,13 @@ TEST_F(EmbedderTest, ExternalTextureGLRefreshedTooOften) {
         res->width = res->height = 100;
         return res;
       });
-  EmbedderExternalTextureGL texture(1, callback);
+  EmbedderExternalTextureGL::ExternalTextureGlStateCallback gl_state_callback(
+      [&](int64_t texture_id) {
+        EXPECT_EQ(texture_id, 1);
+        gl_state_query_count++;
+        return false;
+      });
+  EmbedderExternalTextureGL texture(1, callback, gl_state_callback);
 
   auto skia_surface = surface.GetOnscreenSurface();
   DlSkCanvasAdapter canvas(skia_surface->getCanvas());
@@ -4606,6 +4702,7 @@ TEST_F(EmbedderTest, ExternalTextureGLRefreshedTooOften) {
                   DlImageSampling::kLinear);
 
   EXPECT_TRUE(resolve_called);
+  EXPECT_EQ(gl_state_query_count, 1);
   resolve_called = false;
 
   texture_->Paint(ctx, DlRect::MakeXYWH(0, 0, 100, 100), false,
@@ -4618,6 +4715,7 @@ TEST_F(EmbedderTest, ExternalTextureGLRefreshedTooOften) {
                   DlImageSampling::kLinear);
 
   EXPECT_TRUE(resolve_called);
+  EXPECT_EQ(gl_state_query_count, 2);
 
   glFinish();
 }
@@ -4689,18 +4787,14 @@ TEST_F(
             kSuccess);
   latch.Wait();
 
-  // Since populate_existing_damage is not provided, the partial repaint
-  // functionality is actually disabled. So, the next frame should be entirely
-  // new frame.
+  // Since populate_existing_damage is not provided, the target buffer is
+  // unknown and must be repainted completely. The front-buffer frame damage
+  // remains empty because the retained scene itself did not change.
   context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
-    const size_t num_rects = 1;
-    ASSERT_EQ(present_info.frame_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.frame_damage.damage->left, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->top, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->right, 800);
-    ASSERT_EQ(present_info.frame_damage.damage->bottom, 600);
+    ASSERT_EQ(present_info.frame_damage.num_rects, 0u);
+    ASSERT_EQ(present_info.frame_damage.damage, nullptr);
 
-    ASSERT_EQ(present_info.buffer_damage.num_rects, num_rects);
+    ASSERT_EQ(present_info.buffer_damage.num_rects, 1u);
     ASSERT_EQ(present_info.buffer_damage.damage->left, 0);
     ASSERT_EQ(present_info.buffer_damage.damage->top, 0);
     ASSERT_EQ(present_info.buffer_damage.damage->right, 800);
@@ -4714,8 +4808,7 @@ TEST_F(
   latch.Wait();
 }
 
-TEST_F(EmbedderTest,
-       PresentInfoReceivesJoinedDamageWhenExistingDamageContainsMultipleRects) {
+TEST_F(EmbedderTest, InvalidExistingDamageForcesFullBufferRepaint) {
   auto& context = GetEmbedderContext<EmbedderTestContextGL>();
   context.GetRendererConfig().open_gl.populate_existing_damage =
       [](void* context, const intptr_t id,
@@ -4723,14 +4816,87 @@ TEST_F(EmbedderTest,
     return reinterpret_cast<EmbedderTestContextGL*>(context)
         ->GLPopulateExistingDamage(id, existing_damage);
   };
-  // Return existing damage as the entire screen on purpose.
+  context.SetGLPopulateExistingDamageCallback(
+      [](const intptr_t id, FlutterDamage* existing_damage_ptr) {
+        static FlutterRect invalid_damage[] = {
+            FlutterRect{std::numeric_limits<double>::quiet_NaN(), 0, 1, 1},
+        };
+        existing_damage_ptr->num_rects = 1;
+        existing_damage_ptr->damage = invalid_damage;
+      });
+
+  EmbedderConfigBuilder builder(context);
+  builder.SetSurface(DlISize(800, 600));
+  builder.SetDartEntrypoint("render_gradient_retained");
+  auto engine = builder.LaunchEngine();
+  ASSERT_TRUE(engine.is_valid());
+
+  fml::AutoResetWaitableEvent latch;
+  context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
+    EXPECT_EQ(present_info.frame_damage.num_rects, 1u);
+    EXPECT_NE(present_info.frame_damage.damage, nullptr);
+    if (present_info.frame_damage.damage) {
+      EXPECT_EQ(present_info.frame_damage.damage->left, 0);
+      EXPECT_EQ(present_info.frame_damage.damage->top, 0);
+      EXPECT_EQ(present_info.frame_damage.damage->right, 800);
+      EXPECT_EQ(present_info.frame_damage.damage->bottom, 600);
+    }
+    EXPECT_EQ(present_info.buffer_damage.num_rects, 1u);
+    EXPECT_NE(present_info.buffer_damage.damage, nullptr);
+    if (present_info.buffer_damage.damage) {
+      EXPECT_EQ(present_info.buffer_damage.damage->left, 0);
+      EXPECT_EQ(present_info.buffer_damage.damage->top, 0);
+      EXPECT_EQ(present_info.buffer_damage.damage->right, 800);
+      EXPECT_EQ(present_info.buffer_damage.damage->bottom, 600);
+    }
+    latch.Signal();
+  });
+
+  FlutterWindowMetricsEvent event = {};
+  event.struct_size = sizeof(event);
+  event.width = 800;
+  event.height = 600;
+  event.pixel_ratio = 1.0;
+  ASSERT_EQ(FlutterEngineSendWindowMetricsEvent(engine.get(), &event),
+            kSuccess);
+  latch.Wait();
+
+  context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
+    EXPECT_EQ(present_info.frame_damage.num_rects, 0u);
+    EXPECT_EQ(present_info.frame_damage.damage, nullptr);
+    EXPECT_EQ(present_info.buffer_damage.num_rects, 1u);
+    EXPECT_NE(present_info.buffer_damage.damage, nullptr);
+    if (present_info.buffer_damage.damage) {
+      EXPECT_EQ(present_info.buffer_damage.damage->left, 0);
+      EXPECT_EQ(present_info.buffer_damage.damage->top, 0);
+      EXPECT_EQ(present_info.buffer_damage.damage->right, 800);
+      EXPECT_EQ(present_info.buffer_damage.damage->bottom, 600);
+    }
+    latch.Signal();
+  });
+
+  ASSERT_EQ(FlutterEngineSendWindowMetricsEvent(engine.get(), &event),
+            kSuccess);
+  latch.Wait();
+}
+
+TEST_F(EmbedderTest, PresentInfoConservativelyBoundsComplexGaneshBufferDamage) {
+  auto& context = GetEmbedderContext<EmbedderTestContextGL>();
+  context.GetRendererConfig().open_gl.populate_existing_damage =
+      [](void* context, const intptr_t id,
+         FlutterDamage* existing_damage) -> void {
+    return reinterpret_cast<EmbedderTestContextGL*>(context)
+        ->GLPopulateExistingDamage(id, existing_damage);
+  };
+  // Return fractional, disjoint rectangles to verify both conservative
+  // rounding and preservation of region topology.
   context.SetGLPopulateExistingDamageCallback(
       [](const intptr_t id, FlutterDamage* existing_damage_ptr) {
         const size_t num_rects = 2;
         // The array must be valid after the callback returns.
         static FlutterRect existing_damage_rects[num_rects] = {
-            FlutterRect{100, 150, 200, 250},
-            FlutterRect{200, 250, 300, 350},
+            FlutterRect{100.25, 150.25, 199.25, 249.25},
+            FlutterRect{400.25, 350.25, 499.25, 449.25},
         };
         existing_damage_ptr->num_rects = num_rects;
         existing_damage_ptr->damage = existing_damage_rects;
@@ -4772,22 +4938,18 @@ TEST_F(EmbedderTest,
             kSuccess);
   latch.Wait();
 
-  // Because it's the same as the first frame, the second frame damage should
-  // be empty but, because there was a full existing buffer damage, the buffer
-  // damage should be the entire screen.
+  // Because it's the same as the first frame, the second frame damage is empty.
+  // Ganesh deliberately uses one conservative scissor for a complex repair
+  // region so every draw avoids repeated path-clip analysis.
   context.SetGLPresentCallback([&](FlutterPresentInfo present_info) {
-    const size_t num_rects = 1;
-    ASSERT_EQ(present_info.frame_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.frame_damage.damage->left, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->top, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->right, 0);
-    ASSERT_EQ(present_info.frame_damage.damage->bottom, 0);
+    ASSERT_EQ(present_info.frame_damage.num_rects, 0u);
+    ASSERT_EQ(present_info.frame_damage.damage, nullptr);
 
-    ASSERT_EQ(present_info.buffer_damage.num_rects, num_rects);
-    ASSERT_EQ(present_info.buffer_damage.damage->left, 100);
-    ASSERT_EQ(present_info.buffer_damage.damage->top, 150);
-    ASSERT_EQ(present_info.buffer_damage.damage->right, 300);
-    ASSERT_EQ(present_info.buffer_damage.damage->bottom, 350);
+    ASSERT_EQ(present_info.buffer_damage.num_rects, 1u);
+    ASSERT_EQ(present_info.buffer_damage.damage[0].left, 100);
+    ASSERT_EQ(present_info.buffer_damage.damage[0].top, 150);
+    ASSERT_EQ(present_info.buffer_damage.damage[0].right, 500);
+    ASSERT_EQ(present_info.buffer_damage.damage[0].bottom, 450);
 
     latch.Signal();
   });
@@ -4944,6 +5106,41 @@ TEST_F(EmbedderTest, RenderTextureWithImpellerOpenGL) {
     ASSERT_TRUE(
         ImageMatchesFixture("external_texture_impeller.png", rendered_scene));
   }
+}
+
+TEST_F(EmbedderTest, RenderBoundedBackdropWithImpellerOpenGLAndRootTransform) {
+  constexpr int kWidth = 800;
+  constexpr int kHeight = 600;
+  auto& context = GetEmbedderContext<EmbedderTestContextGL>();
+  EmbedderConfigBuilder builder(context);
+  fml::AutoResetWaitableEvent latch;
+  context.SetGLPresentCallback(
+      [&](FlutterPresentInfo present_info) { latch.Signal(); });
+  context.SetRootSurfaceTransformation(DlMatrix::MakeTranslation({0, kHeight}) *
+                                       DlMatrix::MakeScale({1, -1, 1}));
+  builder.AddCommandLineArgument("--enable-impeller");
+  builder.SetDartEntrypoint("render_impeller_bounded_backdrop_test");
+  builder.SetSurface(DlISize(kWidth, kHeight));
+
+  auto rendered_scene = context.GetNextSceneImage();
+  auto engine = builder.LaunchEngine();
+  ASSERT_TRUE(engine.is_valid());
+
+  FlutterWindowMetricsEvent event = {};
+  event.struct_size = sizeof(event);
+  event.width = kWidth;
+  event.height = kHeight;
+  event.pixel_ratio = 1.0;
+  ASSERT_EQ(FlutterEngineSendWindowMetricsEvent(engine.get(), &event),
+            kSuccess);
+  latch.Wait();
+
+  auto image = rendered_scene.get();
+  ASSERT_TRUE(image);
+  SkPixmap pixels;
+  ASSERT_TRUE(image->peekPixels(&pixels));
+  const auto panel = pixels.getColor(300, 300);
+  EXPECT_GT(SkColorGetR(panel), SkColorGetG(panel) + 80u);
 }
 
 TEST_F(EmbedderTest, RenderTextureWithImpellerOpenGLDestructCallback) {

@@ -14,6 +14,135 @@ namespace testing {
 
 using SaveLayerUtilsTest = ::testing::Test;
 
+TEST(SaveLayerUtilsTest, DirectBackdropPlanAcceptsExactSourceAssignment) {
+  EXPECT_TRUE(CanRenderBackdropLayerDirectly({
+      .has_backdrop_filter = true,
+      .content_is_single_sample_compatible = true,
+      .content_bounds_are_contained = true,
+      .is_root_pass = true,
+      .restore_blend_mode = BlendMode::kSrc,
+      .restore_is_opaque = true,
+  }));
+}
+
+TEST(SaveLayerUtilsTest, DirectBackdropPlanRejectsUnprovenSemantics) {
+  const BackdropLayerDirectPlanInputs accepted = {
+      .has_backdrop_filter = true,
+      .content_is_single_sample_compatible = true,
+      .content_bounds_are_contained = true,
+      .is_root_pass = true,
+      .restore_blend_mode = BlendMode::kSrc,
+      .restore_is_opaque = true,
+  };
+
+  auto rejected = accepted;
+  rejected.has_backdrop_filter = false;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.content_is_single_sample_compatible = false;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.content_bounds_are_contained = false;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.is_root_pass = false;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.restore_blend_mode = BlendMode::kSrcOver;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.restore_is_opaque = false;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.restore_has_effects = true;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.shares_backdrop_input = true;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+
+  rejected = accepted;
+  rejected.inherited_opacity = 0.5f;
+  EXPECT_FALSE(CanRenderBackdropLayerDirectly(rejected));
+}
+
+TEST(SaveLayerUtilsTest, DirectBackdropPlanReportsEveryRejection) {
+  const uint32_t reasons = GetBackdropLayerDirectRejections({});
+  EXPECT_NE(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kMissingBackdropFilter),
+            0u);
+  EXPECT_NE(
+      reasons & static_cast<uint32_t>(
+                    BackdropLayerDirectRejection::kContentNeedsMultisampling),
+      0u);
+  EXPECT_NE(
+      reasons & static_cast<uint32_t>(
+                    BackdropLayerDirectRejection::kContentBoundsUncontained),
+      0u);
+  EXPECT_NE(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kNestedPass),
+            0u);
+  EXPECT_NE(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kRestoreBlendMode),
+            0u);
+  EXPECT_NE(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kRestoreNotOpaque),
+            0u);
+  EXPECT_EQ(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kRestoreHasEffects),
+            0u);
+  EXPECT_EQ(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kSharedBackdropInput),
+            0u);
+  EXPECT_EQ(reasons & static_cast<uint32_t>(
+                          BackdropLayerDirectRejection::kInheritedOpacity),
+            0u);
+}
+
+TEST(SaveLayerUtilsTest, BackdropSurfaceCompositeRequiresExactPhysicalProof) {
+  const BackdropSurfaceCompositePlanInputs accepted = {
+      .backend_supports_external_sampler = true,
+      .backdrop_is_texture = true,
+      .surface_is_external_texture = true,
+      .surface_sampling_is_direct = true,
+      .surface_blend_mode = BlendMode::kSrcOver,
+      .transforms_are_translation_scale = true,
+      .surface_covers_backdrop_scope = true,
+  };
+  EXPECT_TRUE(CanRenderBackdropSurfaceComposite(accepted));
+
+  auto rejected = accepted;
+  rejected.surface_is_external_texture = false;
+  EXPECT_FALSE(CanRenderBackdropSurfaceComposite(rejected));
+
+  rejected = accepted;
+  rejected.surface_sampling_is_direct = false;
+  EXPECT_FALSE(CanRenderBackdropSurfaceComposite(rejected));
+
+  rejected = accepted;
+  rejected.surface_blend_mode = BlendMode::kSrc;
+  EXPECT_FALSE(CanRenderBackdropSurfaceComposite(rejected));
+
+  rejected = accepted;
+  rejected.transforms_are_translation_scale = false;
+  EXPECT_FALSE(CanRenderBackdropSurfaceComposite(rejected));
+
+  rejected = accepted;
+  rejected.surface_covers_backdrop_scope = false;
+  EXPECT_FALSE(CanRenderBackdropSurfaceComposite(rejected));
+}
+
+TEST(SaveLayerUtilsTest, BackdropSurfaceCompositeReportsEveryRejection) {
+  const uint32_t reasons = GetBackdropSurfaceCompositeRejections({});
+  EXPECT_EQ(reasons, (1u << 7u) - 1u);
+}
+
 TEST(SaveLayerUtilsTest, SimplePaintComputedCoverage) {
   // Basic Case, simple paint, computed coverage
   auto coverage = ComputeSaveLayerCoverage(

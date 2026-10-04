@@ -27,6 +27,11 @@ class EmbedderExternalTextureResolver {
 #ifdef SHELL_ENABLE_GL
   explicit EmbedderExternalTextureResolver(
       EmbedderExternalTextureGL::ExternalTextureCallback gl_callback);
+
+  void SetExternalTextureGlStateCallback(
+      EmbedderExternalTextureGL::ExternalTextureGlStateCallback callback);
+  void SetExternalTexturePresentationCallback(
+      EmbedderExternalTextureGL::ExternalTexturePresentationCallback callback);
 #endif
 
 #ifdef SHELL_ENABLE_METAL
@@ -41,6 +46,9 @@ class EmbedderExternalTextureResolver {
  private:
 #ifdef SHELL_ENABLE_GL
   EmbedderExternalTextureGL::ExternalTextureCallback gl_callback_;
+  EmbedderExternalTextureGL::ExternalTextureGlStateCallback gl_state_callback_;
+  EmbedderExternalTextureGL::ExternalTexturePresentationCallback
+      presentation_callback_;
 #endif
 
 #ifdef SHELL_ENABLE_METAL

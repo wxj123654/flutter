@@ -9,6 +9,8 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "flutter/common/settings.h"
 #include "flutter/common/task_runners.h"
@@ -83,6 +85,35 @@ enum class DrawSurfaceStatus {
   // Layer tree was discarded because its size does not match the view size.
   // This typically occurs during resizing.
   kDiscarded,
+};
+
+/// An immutable physical-output projection installed by Denial. Source bounds
+/// use the implicit view's physical pixels; the target size is the scanout
+/// buffer's native physical extent. Flutter applies the arbitrary affine
+/// source-to-target transform and KMS scans the result out without transforming
+/// it.
+struct DenialRenderOutput {
+  int64_t render_view_id;
+  uint64_t configuration_generation;
+  DlRect source_physical_bounds;
+  DlISize target_size;
+  uint32_t scale_120;
+  DlMatrix source_to_target_transform;
+
+  bool operator==(const DenialRenderOutput& other) const {
+    return render_view_id == other.render_view_id &&
+           configuration_generation == other.configuration_generation &&
+           source_physical_bounds == other.source_physical_bounds &&
+           target_size == other.target_size && scale_120 == other.scale_120 &&
+           source_to_target_transform == other.source_to_target_transform;
+  }
+
+  bool HasSameTarget(const DenialRenderOutput& other) const {
+    return render_view_id == other.render_view_id &&
+           configuration_generation == other.configuration_generation &&
+           source_physical_bounds == other.source_physical_bounds &&
+           target_size == other.target_size && scale_120 == other.scale_120;
+  }
 };
 
 // The information to draw to all views of a frame.
@@ -273,6 +304,20 @@ class Rasterizer final : public SnapshotDelegate,
   ///
   void CollectView(int64_t view_id);
 
+  /// Atomically replaces Denial's physical raster-output snapshot. This method
+  /// runs only on the raster task runner between queued frame transactions.
+  void SetDenialRenderOutputs(std::vector<DenialRenderOutput> outputs);
+
+  /// Selects the physical outputs for the next framework-produced scene.
+  void PrepareDenialRenderOutputs(std::vector<int64_t> render_view_ids,
+                                  std::vector<int64_t> texture_identifiers);
+
+  /// Draws the latest scene directly to the selected physical outputs.
+  void DrawDenialRenderOutputs(
+      std::vector<int64_t> render_view_ids,
+      std::vector<int64_t> texture_identifiers,
+      std::unique_ptr<FrameTimingsRecorder> frame_timings_recorder);
+
   //----------------------------------------------------------------------------
   /// @brief      Returns the last successfully drawn layer tree for the given
   ///             view, or nullptr if there isn't any. This is useful during
@@ -309,6 +354,10 @@ class Rasterizer final : public SnapshotDelegate,
   GrDirectContext* GetGrContext() override;
 
   std::shared_ptr<flutter::TextureRegistry> GetTextureRegistry() override;
+
+  // Marks an external texture and remembers its ID for the next autonomous
+  // reused-layer-tree damage calculation.
+  void MarkTextureFrameAvailable(int64_t texture_id);
 
   //----------------------------------------------------------------------------
   /// @brief      Takes the next item from the layer tree pipeline and executes
@@ -603,6 +652,8 @@ class Rasterizer final : public SnapshotDelegate,
   std::optional<DrawSurfaceStatus> GetLastDrawStatus(int64_t view_id);
 
  private:
+  friend class RasterizerTestPeer;
+
   // The result status of DoDraw, DrawToSurfaces, and DrawToSurfacesUnsafe.
   enum class DoDrawStatus {
     // The drawing was done without any specified status.
@@ -765,6 +816,15 @@ class Rasterizer final : public SnapshotDelegate,
       FrameTimingsRecorder& frame_timings_recorder,
       std::vector<std::unique_ptr<LayerTreeTask>> tasks);
 
+  std::vector<std::unique_ptr<LayerTreeTask>> ExpandDenialRenderOutputTasks(
+      std::vector<std::unique_ptr<LayerTreeTask>> tasks);
+
+  std::unique_ptr<LayerTreeTask> ReprojectDenialRenderOutputTask(
+      const DenialRenderOutput& output,
+      const LayerTreeTask& previous_task);
+
+  const DenialRenderOutput* FindDenialRenderOutput(int64_t view_id) const;
+
   // Draws the layer tree to the specified view, assuming we have access to the
   // GPU.
   //
@@ -773,6 +833,8 @@ class Rasterizer final : public SnapshotDelegate,
   DrawSurfaceStatus DrawToSurfaceUnsafe(
       int64_t view_id,
       flutter::LayerTree& layer_tree,
+      const flutter::LayerTree* previous_layer_tree,
+      const std::unordered_set<int64_t>* dirty_texture_ids,
       float device_pixel_ratio,
       std::optional<fml::TimePoint> presentation_time);
 
@@ -791,6 +853,13 @@ class Rasterizer final : public SnapshotDelegate,
   std::unique_ptr<SnapshotSurfaceProducer> snapshot_surface_producer_;
   std::unique_ptr<flutter::CompositorContext> compositor_context_;
   std::unordered_map<int64_t, ViewRecord> view_records_;
+  std::vector<DenialRenderOutput> denial_render_outputs_;
+  uint64_t denial_render_output_generation_ = 0;
+  std::unordered_map<int64_t, std::unique_ptr<LayerTreeTask>>
+      denial_pending_output_tasks_;
+  std::unordered_set<int64_t> denial_selected_render_view_ids_;
+  bool denial_render_selection_pending_ = false;
+  std::unordered_set<int64_t> pending_texture_ids_;
   fml::closure next_frame_callback_;
   bool user_override_resource_cache_bytes_ = false;
   std::optional<size_t> max_cache_bytes_;

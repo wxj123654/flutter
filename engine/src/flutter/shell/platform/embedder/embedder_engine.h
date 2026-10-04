@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "flutter/fml/macros.h"
 #include "flutter/shell/common/shell.h"
@@ -88,6 +89,26 @@ class EmbedderEngine {
 
   bool ScheduleFrame();
 
+  bool RequestFrameForExternalTextures();
+
+  bool ScheduleFrameForExternalTextures(
+      std::vector<int64_t> texture_identifiers);
+
+  bool RenderOutputs(std::vector<int64_t> render_view_ids,
+                     std::vector<int64_t> texture_identifiers,
+                     bool rebuild_scene,
+                     uint64_t frame_start_time_nanos,
+                     uint64_t frame_target_time_nanos);
+
+  bool SetRenderOutputs(std::vector<DenialRenderOutput> outputs);
+
+#ifdef SHELL_ENABLE_GL
+  bool SetExternalTextureGlStateCallback(
+      EmbedderExternalTextureGL::ExternalTextureGlStateCallback callback);
+  bool SetExternalTexturePresentationCallback(
+      EmbedderExternalTextureGL::ExternalTexturePresentationCallback callback);
+#endif
+
   Shell& GetShell();
 
  private:
@@ -97,6 +118,11 @@ class EmbedderEngine {
   std::unique_ptr<ShellArgs> shell_args_;
   std::unique_ptr<Shell> shell_;
   std::unique_ptr<EmbedderExternalTextureResolver> external_texture_resolver_;
+
+  // Platform-thread mirror used only to distinguish a projection update from
+  // a structural output replacement. The rasterizer owns the authoritative
+  // snapshot used for drawing.
+  std::vector<DenialRenderOutput> denial_render_outputs_;
 
   FML_DISALLOW_COPY_AND_ASSIGN(EmbedderEngine);
 };

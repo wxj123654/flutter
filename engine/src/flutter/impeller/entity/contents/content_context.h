@@ -24,10 +24,13 @@
 #include "impeller/renderer/pipeline.h"
 #include "impeller/renderer/pipeline_descriptor.h"
 #include "impeller/renderer/render_target.h"
+#include "impeller/renderer/snapshot.h"
 #include "impeller/typographer/lazy_glyph_atlas.h"
 #include "impeller/typographer/typographer_context.h"
 
 namespace impeller {
+class BackdropSnapshotPins;
+
 /// Pipeline state configuration.
 ///
 /// Each unique combination of these options requires a different pipeline state
@@ -183,6 +186,7 @@ class ContentContext {
   PipelineRef GetFramebufferBlendScreenPipeline(ContentContextOptions opts) const;
   PipelineRef GetFramebufferBlendSoftLightPipeline(ContentContextOptions opts) const;
   PipelineRef GetGaussianBlurPipeline(ContentContextOptions opts) const;
+  PipelineRef GetGlassPipeline(ContentContextOptions opts) const;
   PipelineRef GetGlyphAtlasPipeline(ContentContextOptions opts) const;
   PipelineRef GetLinePipeline(ContentContextOptions opts) const;
   PipelineRef GetLinearGradientFillPipeline(ContentContextOptions opts) const;
@@ -218,6 +222,8 @@ class ContentContext {
   PipelineRef GetComplexRSEPipeline(ContentContextOptions opts) const;
 #ifdef IMPELLER_ENABLE_OPENGLES
 #if !defined(FML_OS_EMSCRIPTEN)
+  PipelineRef GetBackdropSurfaceCompositePipeline(ContentContextOptions opts) const;
+  PipelineRef GetBackdropSurfaceCompositeTexturePipeline(ContentContextOptions opts) const;
   PipelineRef GetTiledTextureExternalPipeline(ContentContextOptions opts) const;
   PipelineRef GetTiledTextureUvExternalPipeline(ContentContextOptions opts) const;
 #endif
@@ -323,6 +329,20 @@ class ContentContext {
 
   TextShadowCache& GetTextShadowCache() const { return *text_shadow_cache_; }
 
+  // Backdrop snapshots are semantic, cross-frame cache entries. Their keys
+  // are versioned by Flutter's ordered layer diff, so a hit means the pixels
+  // sampled below the filter are unchanged even if its child repaints.
+  std::optional<Snapshot> GetCachedBackdropSnapshot(int64_t key);
+  // New families wait for a repeated version before materializing. A family
+  // whose previous snapshot was actually reused refreshes on the first changed
+  // frame, avoiding a second filter evaluation just to populate the cache.
+  // Calling this also retires older cached generations of the same family.
+  bool ShouldMaterializeBackdropSnapshot(int64_t key);
+  // Called only after rendering accepts the snapshot's coverage. Merely finding
+  // or pinning a snapshot does not establish that caching saved any work.
+  void RecordBackdropSnapshotReuse(int64_t key);
+  void CacheBackdropSnapshot(int64_t key, const Snapshot& snapshot);
+
  protected:
   // Visible for testing.
   void SetTransientsIndexesBuffer(std::shared_ptr<HostBuffer> host_buffer) {
@@ -386,10 +406,55 @@ class ContentContext {
   bool is_texture_caching_enabled_ = false;
   mutable std::unordered_map<const flutter::DlImage*, std::shared_ptr<Texture>>
       texture_cache_;
+  struct BackdropSnapshotCacheEntry {
+    Snapshot snapshot;
+    size_t byte_size;
+    uint64_t last_access;
+  };
+  std::unordered_map<int64_t, BackdropSnapshotCacheEntry>
+      backdrop_snapshot_cache_;
+  friend class BackdropSnapshotPins;
+  BackdropSnapshotPins* backdrop_snapshot_pins_ = nullptr;
+  size_t backdrop_snapshot_cache_bytes_ = 0u;
+  uint64_t backdrop_snapshot_cache_access_ = 0u;
+
+  struct BackdropSnapshotObservation {
+    int64_t key;
+    uint32_t observations;
+    uint64_t last_access;
+    bool reused = false;
+  };
+  std::unordered_map<uint32_t, BackdropSnapshotObservation>
+      backdrop_snapshot_observations_;
+  uint64_t backdrop_snapshot_observation_access_ = 0u;
+
+  void RetireOlderBackdropSnapshotGenerations(int64_t key);
 
   ContentContext(const ContentContext&) = delete;
 
   ContentContext& operator=(const ContentContext&) = delete;
+};
+
+// Reserves existing snapshots used to omit readback repair from a frame's
+// damage. Pins outlive DisplayList recording through submission, independently
+// of normal cache eviction. Nested recording scopes preserve outer pins.
+class BackdropSnapshotPins {
+ public:
+  explicit BackdropSnapshotPins(ContentContext& context,
+                                const Matrix& damage_to_snapshot = Matrix());
+  ~BackdropSnapshotPins();
+
+  bool Pin(int64_t key, const Rect& coverage);
+
+  BackdropSnapshotPins(const BackdropSnapshotPins&) = delete;
+  BackdropSnapshotPins& operator=(const BackdropSnapshotPins&) = delete;
+
+ private:
+  friend class ContentContext;
+  ContentContext& context_;
+  const Matrix damage_to_snapshot_;
+  BackdropSnapshotPins* previous_;
+  std::unordered_map<int64_t, Snapshot> snapshots_;
 };
 
 }  // namespace impeller

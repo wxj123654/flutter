@@ -4,6 +4,8 @@
 
 #include "flutter/shell/platform/embedder/embedder_engine.h"
 
+#include <algorithm>
+
 #include "flutter/fml/make_copyable.h"
 #include "flutter/shell/platform/embedder/vsync_waiter_embedder.h"
 
@@ -343,6 +345,86 @@ bool EmbedderEngine::ScheduleFrame() {
   platform_view->ScheduleFrame();
   return true;
 }
+
+bool EmbedderEngine::RequestFrameForExternalTextures() {
+  if (!IsValid()) {
+    return false;
+  }
+  shell_->RequestFrameForExternalTextures();
+  return true;
+}
+
+bool EmbedderEngine::ScheduleFrameForExternalTextures(
+    std::vector<int64_t> texture_identifiers) {
+  if (!IsValid() || texture_identifiers.empty()) {
+    return false;
+  }
+  shell_->ScheduleFrameForExternalTextures(std::move(texture_identifiers));
+  return true;
+}
+
+bool EmbedderEngine::RenderOutputs(std::vector<int64_t> render_view_ids,
+                                   std::vector<int64_t> texture_identifiers,
+                                   bool rebuild_scene,
+                                   uint64_t frame_start_time_nanos,
+                                   uint64_t frame_target_time_nanos) {
+  if (!IsValid() || render_view_ids.empty()) {
+    return false;
+  }
+  shell_->RenderOutputs(std::move(render_view_ids),
+                        std::move(texture_identifiers), rebuild_scene,
+                        frame_start_time_nanos, frame_target_time_nanos);
+  return true;
+}
+
+bool EmbedderEngine::SetRenderOutputs(std::vector<DenialRenderOutput> outputs) {
+  if (!IsValid()) {
+    return false;
+  }
+
+  const bool presentation_only =
+      outputs.size() == denial_render_outputs_.size() &&
+      std::equal(outputs.begin(), outputs.end(), denial_render_outputs_.begin(),
+                 [](const auto& current, const auto& previous) {
+                   return current.HasSameTarget(previous);
+                 });
+  denial_render_outputs_ = outputs;
+  auto rasterizer = shell_->GetRasterizer();
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
+      [rasterizer, outputs = std::move(outputs)]() mutable {
+        if (rasterizer) {
+          rasterizer->SetDenialRenderOutputs(std::move(outputs));
+        }
+      });
+  // A matrix-only update is consumed by Denial's next output-clock raster
+  // transaction. Scheduling a framework frame here would rebuild the Dart
+  // scene for every animation sample even though its contents are unchanged.
+  return presentation_only || ScheduleFrame();
+}
+
+#ifdef SHELL_ENABLE_GL
+bool EmbedderEngine::SetExternalTextureGlStateCallback(
+    EmbedderExternalTextureGL::ExternalTextureGlStateCallback callback) {
+  if (!external_texture_resolver_ ||
+      !external_texture_resolver_->SupportsExternalTextures() || !callback) {
+    return false;
+  }
+  external_texture_resolver_->SetExternalTextureGlStateCallback(
+      std::move(callback));
+  return true;
+}
+
+bool EmbedderEngine::SetExternalTexturePresentationCallback(
+    EmbedderExternalTextureGL::ExternalTexturePresentationCallback callback) {
+  if (!external_texture_resolver_ ||
+      !external_texture_resolver_->SupportsExternalTextures() || !callback) {
+    return false;
+  }
+  external_texture_resolver_->SetExternalTexturePresentationCallback(
+      std::move(callback));
+  return true;
+}
+#endif
 
 Shell& EmbedderEngine::GetShell() {
   FML_DCHECK(shell_);

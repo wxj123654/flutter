@@ -57,6 +57,8 @@ class TextureContents final : public Contents {
   /// space.
   void SetDestinationRect(Rect rect);
 
+  const Rect& GetDestinationRect() const;
+
   void SetTexture(std::shared_ptr<Texture> texture);
 
   std::shared_ptr<Texture> GetTexture() const;
@@ -93,6 +95,10 @@ class TextureContents final : public Contents {
   Scalar GetOpacity() const;
 
   void SetStencilEnabled(bool enabled);
+
+  void SetIsExternalTexture(bool is_external_texture);
+
+  bool IsExternalTexture() const;
 
   // |Contents|
   std::optional<Rect> GetCoverage(const Entity& entity) const override;
@@ -142,6 +148,7 @@ class TextureContents final : public Contents {
   Scalar inherited_opacity_ = 1.0f;
   bool defer_applying_opacity_ = false;
   bool snapshots_need_rasterization_for_runtime_effects_ = false;
+  bool is_external_texture_ = false;
 
   TextureContents(const TextureContents&) = delete;
 

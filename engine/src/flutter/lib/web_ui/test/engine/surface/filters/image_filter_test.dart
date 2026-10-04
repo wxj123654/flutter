@@ -15,6 +15,25 @@ void main() {
 
 void testMain() {
   group('ImageFilter constructors', () {
+    test('blur accepts native compositor controls on Web', () {
+      final ordinary = ImageFilter.blur(sigmaX: 2, sigmaY: 3);
+      final nativeControls = ImageFilter.blur(
+        sigmaX: 2,
+        sigmaY: 3,
+        downsampleScale: 0.5,
+        backdropAlphaThreshold: 0.25,
+        backdropAlphaThresholdIsSingleSurface: true,
+      );
+      expect(nativeControls, ordinary);
+    });
+
+    test('native glass reports unsupported Web backend', () {
+      expect(
+        () => ImageFilter.glass(shape: RRect.fromRectXY(const Rect.fromLTWH(0, 0, 20, 10), 3, 3)),
+        throwsUnsupportedError,
+      );
+    });
+
     test('matrix is copied', () {
       final matrix = Matrix4.identity();
       final Float64List storage = matrix.toFloat64();

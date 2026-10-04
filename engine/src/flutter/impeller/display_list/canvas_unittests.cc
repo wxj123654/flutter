@@ -3,6 +3,8 @@
 // found in the LICENSE file.
 
 #include <unordered_map>
+
+#include "flutter/common/backdrop_filter_cache_key.h"
 #include "flutter/display_list/dl_tile_mode.h"
 #include "flutter/display_list/effects/dl_image_filter.h"
 #include "flutter/display_list/geometry/dl_geometry_types.h"
@@ -15,6 +17,7 @@
 #include "impeller/display_list/dl_image_impeller.h"
 #include "impeller/display_list/dl_runtime_effect_impeller.h"
 #include "impeller/display_list/dl_vertices_geometry.h"
+#include "impeller/entity/contents/filters/glass_filter_contents.h"
 #include "impeller/geometry/geometry_asserts.h"
 #include "impeller/playground/playground.h"
 #include "impeller/playground/widgets.h"
@@ -67,6 +70,225 @@ std::unique_ptr<Canvas> CreateTestCanvas(
   }
   return std::make_unique<Canvas>(context, render_target, /*is_onscreen=*/false,
                                   /*requires_readback=*/requires_readback);
+}
+
+TEST_P(AiksTest, BackdropSnapshotCacheReplacesOlderFamilyGeneration) {
+  ContentContext context(GetContext(), nullptr);
+  TextureDescriptor texture_descriptor;
+  texture_descriptor.size = {4, 4};
+  texture_descriptor.format =
+      context.GetDeviceCapabilities().GetDefaultColorFormat();
+  texture_descriptor.usage = TextureUsage::kRenderTarget;
+  texture_descriptor.storage_mode = StorageMode::kDevicePrivate;
+
+  auto texture = context.GetContext()->GetResourceAllocator()->CreateTexture(
+      texture_descriptor);
+  ASSERT_TRUE(texture);
+  Snapshot snapshot{.texture = texture};
+
+  const int64_t first = flutter::MakeBackdropFilterCacheKey(7u, 1u);
+  const int64_t second = flutter::MakeBackdropFilterCacheKey(7u, 2u);
+  context.CacheBackdropSnapshot(first, snapshot);
+  EXPECT_TRUE(context.GetCachedBackdropSnapshot(first).has_value());
+
+  // A newly changed generation is rendered directly once. Observing it also
+  // retires the obsolete cached generation immediately.
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(second));
+  EXPECT_FALSE(context.GetCachedBackdropSnapshot(first).has_value());
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(second));
+
+  context.CacheBackdropSnapshot(second, snapshot);
+  EXPECT_TRUE(context.GetCachedBackdropSnapshot(second).has_value());
+}
+
+TEST_P(AiksTest, BackdropSnapshotPinsSurviveCacheRetirementUntilSubmission) {
+  ContentContext context(GetContext(), nullptr);
+  TextureDescriptor descriptor;
+  descriptor.size = {4, 4};
+  descriptor.format = context.GetDeviceCapabilities().GetDefaultColorFormat();
+  descriptor.usage = TextureUsage::kRenderTarget;
+  descriptor.storage_mode = StorageMode::kDevicePrivate;
+  auto texture =
+      context.GetContext()->GetResourceAllocator()->CreateTexture(descriptor);
+  ASSERT_TRUE(texture);
+  const int64_t first = flutter::MakeBackdropFilterCacheKey(7u, 1u);
+  const int64_t second = flutter::MakeBackdropFilterCacheKey(7u, 2u);
+  context.CacheBackdropSnapshot(first, Snapshot{.texture = texture});
+  {
+    BackdropSnapshotPins pins(context);
+    EXPECT_FALSE(pins.Pin(second, Rect::MakeWH(4, 4)));
+    EXPECT_FALSE(pins.Pin(first, Rect::MakeWH(5, 4)));
+    EXPECT_TRUE(pins.Pin(first, Rect::MakeWH(4, 4)));
+    // Retirement can happen while other layers are rendered before this one.
+    EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(second));
+    ASSERT_TRUE(context.GetCachedBackdropSnapshot(first));
+    EXPECT_EQ(context.GetCachedBackdropSnapshot(first)->texture, texture);
+    {
+      BackdropSnapshotPins nested(context);
+      EXPECT_TRUE(nested.Pin(first, Rect::MakeWH(4, 4)));
+    }
+    EXPECT_TRUE(context.GetCachedBackdropSnapshot(first));
+  }
+  EXPECT_FALSE(context.GetCachedBackdropSnapshot(first));
+}
+
+TEST_P(AiksTest, GlassBackdropSnapshotCoversFractionalExtentAfterRootFlip) {
+  ContentContext context(GetContext(), nullptr);
+  TextureDescriptor descriptor;
+  descriptor.size = {1920, 1080};
+  descriptor.format = context.GetDeviceCapabilities().GetDefaultColorFormat();
+  descriptor.usage = TextureUsage::kRenderTarget | TextureUsage::kShaderRead;
+  descriptor.storage_mode = StorageMode::kDevicePrivate;
+  auto texture =
+      context.GetContext()->GetResourceAllocator()->CreateTexture(descriptor);
+  ASSERT_TRUE(texture);
+
+  const Matrix root_flip =
+      Matrix::MakeTranslation({0, 1080, 0}) * Matrix::MakeScale({1, -1, 1});
+  // A panel pill and a maximized window at fractional output scale. The
+  // latter is just over an integral width, which previously lost a column.
+  const std::array<Rect, 2> bounds = {
+      Rect::MakeXYWH(1465.8098f, 5.5f, 97.9f, 24.2f),
+      Rect::MakeLTRB(17, 36, 1904.0001f, 1064.0001f)};
+  uint32_t family = 1;
+  for (const Rect& damage_coverage : bounds) {
+    const Rect target_coverage = damage_coverage.TransformBounds(root_flip);
+    GlassFilterContents glass(
+        RoundRect::MakeRectXY(damage_coverage, 10, 10),
+        /*thickness=*/20, /*refraction=*/0.55, /*dispersion=*/0.12,
+        /*saturation=*/1.2, Color::White(), /*tint_strength=*/0.08,
+        /*brightness=*/0.06, /*light_angle=*/0, /*light_intensity=*/0.7,
+        /*edge_strength=*/0.4);
+    auto input = FilterInput::Make(texture);
+    glass.SetInputs({input, input});
+    glass.SetEffectTransform(Matrix::MakeScale({1.1f, -1.1f, 1}));
+    glass.SetIsBackdropFilter(true);
+    glass.SetMaterialTransform(root_flip);
+    const auto snapshot = glass.RenderToSnapshot(
+        context, Entity{}, {.coverage_limit = target_coverage});
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(snapshot->texture->GetSize(),
+              ISize::Ceil(target_coverage.GetSize()));
+    // Padded allocation must not scale the image or its optical coordinates.
+    EXPECT_EQ(snapshot->transform,
+              Matrix::MakeTranslation(target_coverage.GetOrigin()));
+    ASSERT_TRUE(snapshot->GetCoverage());
+    EXPECT_TRUE(snapshot->GetCoverage()->Contains(target_coverage));
+
+    const int64_t key = flutter::MakeBackdropFilterCacheKey(family++, 1u);
+    context.CacheBackdropSnapshot(key, snapshot.value());
+    {
+      BackdropSnapshotPins unmapped(context);
+      EXPECT_FALSE(unmapped.Pin(key, damage_coverage));
+    }
+    BackdropSnapshotPins pins(context, root_flip);
+    EXPECT_TRUE(pins.Pin(key, damage_coverage));
+    EXPECT_FALSE(pins.Pin(key, damage_coverage.Expand(Vector2(2, 2))));
+    EXPECT_EQ(context.GetCachedBackdropSnapshot(key)->texture,
+              snapshot->texture);
+  }
+}
+
+TEST_P(AiksTest, GlassUncachedLayerMatchesSnapshotCoverage) {
+  ContentContext context(GetContext(), nullptr);
+  TextureDescriptor descriptor;
+  descriptor.size = {1920, 1080};
+  descriptor.format = context.GetDeviceCapabilities().GetDefaultColorFormat();
+  descriptor.usage = TextureUsage::kRenderTarget | TextureUsage::kShaderRead;
+  descriptor.storage_mode = StorageMode::kDevicePrivate;
+  auto texture =
+      context.GetContext()->GetResourceAllocator()->CreateTexture(descriptor);
+  ASSERT_TRUE(texture);
+
+  const Rect material_bounds = Rect::MakeXYWH(400, 300, 200, 50);
+  GlassFilterContents glass(
+      RoundRect::MakeRectXY(Rect::MakeSize(material_bounds.GetSize()), 10, 10),
+      /*thickness=*/20, /*refraction=*/0.55, /*dispersion=*/0.12,
+      /*saturation=*/1.2, Color::White(), /*tint_strength=*/0.08,
+      /*brightness=*/0.06, /*light_angle=*/0, /*light_intensity=*/0.7,
+      /*edge_strength=*/0.4);
+  auto input = FilterInput::Make(texture);
+  glass.SetInputs({input, input});
+  glass.SetIsBackdropFilter(true);
+  glass.SetMaterialTransform(
+      Matrix::MakeTranslation(material_bounds.GetOrigin()));
+  const auto cached = glass.RenderToSnapshot(
+      context, Entity{}, {.coverage_limit = material_bounds});
+  ASSERT_TRUE(cached);
+
+  // Exercise the actual filter evaluation used by Canvas's uncached child
+  // layer. Its input moves to layer-local coordinates; the shape must follow.
+  // Inspect only geometry and allocation metadata, never rendered pixels.
+  const Matrix input_transform =
+      Matrix::MakeTranslation(Vector3(-400, -300, 0));
+  Entity child_entity;
+  child_entity.SetTransform(input_transform);
+  const auto uncached = glass.GetEntity(context, child_entity, std::nullopt);
+  ASSERT_TRUE(uncached);
+  ASSERT_TRUE(uncached->GetCoverage());
+  ASSERT_TRUE(cached->GetCoverage());
+  EXPECT_EQ(uncached->GetCoverage().value(),
+            cached->GetCoverage()->TransformBounds(input_transform));
+  EXPECT_EQ(uncached->GetCoverage().value(), Rect::MakeXYWH(0, 0, 200, 50));
+}
+
+TEST_P(AiksTest, BackdropSnapshotMaterializesOnlyAfterGenerationIsStable) {
+  ContentContext context(GetContext(), nullptr);
+  const int64_t first = flutter::MakeBackdropFilterCacheKey(11u, 1u);
+  const int64_t second = flutter::MakeBackdropFilterCacheKey(11u, 2u);
+
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(first));
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(first));
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(first));
+
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(second));
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(second));
+
+  // Legacy public backdrop IDs do not encode a generation, so their previous
+  // eager-cache behavior is preserved.
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(17));
+}
+
+TEST_P(AiksTest, BackdropSnapshotRefreshesImmediatelyAfterSuccessfulReuse) {
+  ContentContext context(GetContext(), nullptr);
+  const auto key = [](uint32_t generation) {
+    return flutter::MakeBackdropFilterCacheKey(27u, generation);
+  };
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(key(1)));
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(key(1)));
+
+  TextureDescriptor descriptor;
+  descriptor.size = {100, 100};
+  descriptor.format = context.GetDeviceCapabilities().GetDefaultColorFormat();
+  descriptor.usage = TextureUsage::kRenderTarget | TextureUsage::kShaderRead;
+  descriptor.storage_mode = StorageMode::kDevicePrivate;
+  auto texture =
+      context.GetContext()->GetResourceAllocator()->CreateTexture(descriptor);
+  ASSERT_TRUE(texture);
+  context.CacheBackdropSnapshot(key(1), Snapshot{.texture = texture});
+
+  // Exercise the renderer's successful coverage check, not just the admission
+  // policy API. A reused ordinary blur teaches this family that caching helps.
+  auto canvas = CreateTestCanvas(context, Rect::MakeWH(100, 100),
+                                 /*requires_readback=*/true);
+  canvas->SetBackdropData({{key(1), BackdropData{.backdrop_count = 1}}}, 1);
+  auto blur =
+      flutter::DlImageFilter::MakeBlur(4, 4, flutter::DlTileMode::kClamp);
+  canvas->SaveLayer({}, Rect::MakeWH(50, 50), blur.get(),
+                    ContentBoundsPromise::kContainsContents,
+                    /*total_content_depth=*/1, /*can_distribute_opacity=*/false,
+                    key(1));
+  canvas->Restore();
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(key(2)));
+
+  // If motion starts, a refresh that is never reused must not keep promoting
+  // every subsequent version. Old pinned generations cannot teach the new one.
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(key(3)));
+  context.RecordBackdropSnapshotReuse(key(1));
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(key(4)));
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(key(5)));
+  EXPECT_TRUE(context.ShouldMaterializeBackdropSnapshot(key(5)));
+  EXPECT_FALSE(context.ShouldMaterializeBackdropSnapshot(key(6)));
 }
 
 TEST_P(AiksTest, TransformMultipliesCorrectly) {

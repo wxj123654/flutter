@@ -10,7 +10,12 @@
 #include <memory>
 #include <optional>
 
+#include "flutter/display_list/dl_builder.h"
+#include "flutter/flow/compositor_context.h"
 #include "flutter/flow/frame_timings.h"
+#include "flutter/flow/layers/clip_rect_layer.h"
+#include "flutter/flow/layers/display_list_layer.h"
+#include "flutter/flow/layers/transform_layer.h"
 #include "flutter/fml/synchronization/count_down_latch.h"
 #include "flutter/fml/time/time_point.h"
 #include "flutter/shell/common/thread_host.h"
@@ -43,6 +48,14 @@ std::vector<std::unique_ptr<LayerTreeTask>> SingleLayerTreeList(
   tasks.push_back(std::make_unique<LayerTreeTask>(
       view_id, std::move(layer_tree), pixel_ratio));
   return tasks;
+}
+
+DlMatrix ProjectRect(const DlRect& source, const DlISize& target) {
+  const auto scale_x = static_cast<DlScalar>(target.width) / source.GetWidth();
+  const auto scale_y =
+      static_cast<DlScalar>(target.height) / source.GetHeight();
+  return DlMatrix::MakeScale({scale_x, scale_y, 1.0f}) *
+         DlMatrix::MakeTranslation({-source.GetX(), -source.GetY(), 0.0f});
 }
 
 class MockDelegate : public Rasterizer::Delegate {
@@ -127,12 +140,361 @@ class MockExternalViewEmbedder : public ExternalViewEmbedder {
 };
 }  // namespace
 
+class RasterizerTestPeer {
+ public:
+  static std::vector<std::unique_ptr<LayerTreeTask>> ExpandRenderOutputs(
+      Rasterizer& rasterizer,
+      std::vector<std::unique_ptr<LayerTreeTask>> tasks) {
+    return rasterizer.ExpandDenialRenderOutputTasks(std::move(tasks));
+  }
+
+  static const DenialRenderOutput* FindRenderOutput(Rasterizer& rasterizer,
+                                                    int64_t view_id) {
+    return rasterizer.FindDenialRenderOutput(view_id);
+  }
+
+  static std::unique_ptr<LayerTreeTask> ReprojectRenderOutput(
+      Rasterizer& rasterizer,
+      const DenialRenderOutput& output,
+      const LayerTreeTask& previous_task) {
+    return rasterizer.ReprojectDenialRenderOutputTask(output, previous_task);
+  }
+
+  static uint64_t ConfigurationGeneration(const Rasterizer& rasterizer) {
+    return rasterizer.denial_render_output_generation_;
+  }
+
+  static const LayerTreeTask* PendingRenderOutput(const Rasterizer& rasterizer,
+                                                  int64_t view_id) {
+    auto found = rasterizer.denial_pending_output_tasks_.find(view_id);
+    return found == rasterizer.denial_pending_output_tasks_.end()
+               ? nullptr
+               : found->second.get();
+  }
+
+  static void SetLastSuccessfulTask(Rasterizer& rasterizer,
+                                    std::unique_ptr<LayerTreeTask> task) {
+    const int64_t view_id = task->view_id;
+    rasterizer.EnsureViewRecord(view_id).last_successful_task = std::move(task);
+  }
+
+  static const LayerTreeTask* LastSuccessfulTask(const Rasterizer& rasterizer,
+                                                 int64_t view_id) {
+    auto found = rasterizer.view_records_.find(view_id);
+    return found == rasterizer.view_records_.end()
+               ? nullptr
+               : found->second.last_successful_task.get();
+  }
+};
+
 TEST(RasterizerTest, create) {
   NiceMock<MockDelegate> delegate;
   Settings settings;
   ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
   auto rasterizer = std::make_unique<Rasterizer>(delegate);
   EXPECT_TRUE(rasterizer != nullptr);
+}
+
+TEST(RasterizerTest, DenialRenderOutputsProjectOneSceneToNativeTargets) {
+  NiceMock<MockDelegate> delegate;
+  Settings settings;
+  ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
+  Rasterizer rasterizer(delegate);
+
+  constexpr uint64_t kGeneration = 41;
+  const DenialRenderOutput right_output = {
+      .render_view_id = -3,
+      .configuration_generation = kGeneration,
+      .source_physical_bounds = DlRect::MakeXYWH(200, 100, 800, 600),
+      .target_size = DlISize(1200, 900),
+      .scale_120 = 180,
+      .source_to_target_transform =
+          ProjectRect(DlRect::MakeXYWH(200, 100, 800, 600), DlISize(1200, 900)),
+  };
+  const DenialRenderOutput left_output = {
+      .render_view_id = -8,
+      .configuration_generation = kGeneration,
+      .source_physical_bounds = DlRect::MakeXYWH(0, 0, 200, 900),
+      .target_size = DlISize(200, 900),
+      .scale_120 = 120,
+      .source_to_target_transform = DlMatrix(),
+  };
+  rasterizer.SetDenialRenderOutputs({right_output, left_output});
+
+  EXPECT_EQ(RasterizerTestPeer::ConfigurationGeneration(rasterizer),
+            kGeneration);
+  ASSERT_NE(RasterizerTestPeer::FindRenderOutput(rasterizer, -8), nullptr);
+  ASSERT_NE(RasterizerTestPeer::FindRenderOutput(rasterizer, -3), nullptr);
+  EXPECT_EQ(RasterizerTestPeer::FindRenderOutput(rasterizer, -8)->target_size,
+            left_output.target_size);
+  EXPECT_EQ(RasterizerTestPeer::FindRenderOutput(rasterizer, -3)->target_size,
+            right_output.target_size);
+
+  auto source_root = std::make_shared<ContainerLayer>();
+  auto tasks = SingleLayerTreeList(
+      kImplicitViewId,
+      std::make_unique<LayerTree>(source_root, DlISize(1000, 900)), 1.5f);
+  tasks.front()->is_reused_layer_tree = true;
+  tasks.front()->dirty_texture_ids = std::unordered_set<int64_t>{7, 11};
+  auto expanded =
+      RasterizerTestPeer::ExpandRenderOutputs(rasterizer, std::move(tasks));
+
+  ASSERT_EQ(expanded.size(), 2u);
+  EXPECT_EQ(expanded[0]->view_id, -8);
+  EXPECT_EQ(expanded[1]->view_id, -3);
+  EXPECT_EQ(expanded[0]->layer_tree->frame_size(), DlISize(200, 900));
+  EXPECT_EQ(expanded[1]->layer_tree->frame_size(), DlISize(1200, 900));
+  EXPECT_FLOAT_EQ(expanded[0]->device_pixel_ratio, 1.0f);
+  EXPECT_FLOAT_EQ(expanded[1]->device_pixel_ratio, 1.5f);
+  EXPECT_EQ(expanded[0]->render_output_configuration_generation, kGeneration);
+  EXPECT_EQ(expanded[1]->render_output_configuration_generation, kGeneration);
+  ASSERT_TRUE(expanded[0]->dirty_texture_ids.has_value());
+  ASSERT_TRUE(expanded[1]->dirty_texture_ids.has_value());
+  EXPECT_EQ(*expanded[0]->dirty_texture_ids,
+            (std::unordered_set<int64_t>{7, 11}));
+  EXPECT_EQ(*expanded[1]->dirty_texture_ids,
+            (std::unordered_set<int64_t>{7, 11}));
+
+  const DenialRenderOutput expected_outputs[] = {left_output, right_output};
+  for (size_t index = 0; index < expanded.size(); index++) {
+    const auto& task = expanded[index];
+    const auto& expected = expected_outputs[index];
+    auto* clip = static_cast<ClipRectLayer*>(task->layer_tree->root_layer());
+    ASSERT_NE(clip, nullptr);
+    EXPECT_EQ(clip->clip_rect(), DlRect::MakeWH(expected.target_size.width,
+                                                expected.target_size.height));
+    ASSERT_EQ(clip->layers().size(), 1u);
+    auto* transform =
+        static_cast<TransformLayer*>(clip->layers().front().get());
+    ASSERT_NE(transform, nullptr);
+    ASSERT_EQ(transform->layers().size(), 1u);
+    auto* source_clip =
+        static_cast<ClipRectLayer*>(transform->layers().front().get());
+    ASSERT_NE(source_clip, nullptr);
+    EXPECT_EQ(source_clip->clip_rect(), expected.source_physical_bounds);
+    ASSERT_EQ(source_clip->layers().size(), 1u);
+    EXPECT_EQ(source_clip->layers().front(), source_root);
+    EXPECT_EQ(expected.source_physical_bounds.TransformAndClipBounds(
+                  transform->transform()),
+              DlRect::MakeWH(expected.target_size.width,
+                             expected.target_size.height));
+  }
+}
+
+TEST(RasterizerTest, DenialPresentationUpdateReusesRetainedSourceScene) {
+  NiceMock<MockDelegate> delegate;
+  Settings settings;
+  ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
+  Rasterizer rasterizer(delegate);
+
+  constexpr uint64_t kGeneration = 42;
+  DenialRenderOutput output = {
+      .render_view_id = -5,
+      .configuration_generation = kGeneration,
+      .source_physical_bounds = DlRect::MakeWH(800, 600),
+      .target_size = DlISize(800, 600),
+      .scale_120 = 120,
+      .source_to_target_transform = DlMatrix(),
+  };
+  rasterizer.SetDenialRenderOutputs({output});
+  auto source_root = std::make_shared<ContainerLayer>();
+  auto expanded = RasterizerTestPeer::ExpandRenderOutputs(
+      rasterizer,
+      SingleLayerTreeList(
+          kImplicitViewId,
+          std::make_unique<LayerTree>(source_root, DlISize(800, 600)), 1.0f));
+  ASSERT_EQ(expanded.size(), 1u);
+
+  output.source_to_target_transform =
+      DlMatrix::MakeTranslation({800.0f, 0.0f, 0.0f}) *
+      DlMatrix::MakeRotationZ(DlDegrees(90));
+  auto reprojected = RasterizerTestPeer::ReprojectRenderOutput(
+      rasterizer, output, *expanded.front());
+  ASSERT_NE(reprojected, nullptr);
+  auto* clip =
+      static_cast<ClipRectLayer*>(reprojected->layer_tree->root_layer());
+  ASSERT_EQ(clip->layers().size(), 1u);
+  auto* transform = static_cast<TransformLayer*>(clip->layers().front().get());
+  EXPECT_EQ(transform->transform(), output.source_to_target_transform);
+  ASSERT_EQ(transform->layers().size(), 1u);
+  auto* source_clip =
+      static_cast<ClipRectLayer*>(transform->layers().front().get());
+  ASSERT_EQ(source_clip->layers().size(), 1u);
+  EXPECT_EQ(source_clip->layers().front(), source_root);
+}
+
+TEST(RasterizerTest, DenialSyntheticRenderTasksAreNeverExpandedAgain) {
+  NiceMock<MockDelegate> delegate;
+  Settings settings;
+  ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
+  Rasterizer rasterizer(delegate);
+  rasterizer.SetDenialRenderOutputs({{
+      .render_view_id = -1,
+      .configuration_generation = 9,
+      .source_physical_bounds = DlRect::MakeXYWH(0, 0, 800, 600),
+      .target_size = DlISize(800, 600),
+      .scale_120 = 120,
+      .source_to_target_transform = DlMatrix(),
+  }});
+
+  auto root = std::make_shared<ContainerLayer>();
+  auto tasks = SingleLayerTreeList(
+      -1, std::make_unique<LayerTree>(root, DlISize(800, 600)), 1.0f);
+  tasks.front()->is_reused_layer_tree = true;
+  auto expanded =
+      RasterizerTestPeer::ExpandRenderOutputs(rasterizer, std::move(tasks));
+
+  ASSERT_EQ(expanded.size(), 1u);
+  EXPECT_EQ(expanded.front()->view_id, -1);
+  EXPECT_EQ(expanded.front()->layer_tree->root_layer_shared(), root);
+  EXPECT_TRUE(expanded.front()->is_reused_layer_tree);
+}
+
+TEST(RasterizerTest, DenialRenderOutputProjectionPreservesSceneDamage) {
+  NiceMock<MockDelegate> delegate;
+  Settings settings;
+  ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
+  Rasterizer rasterizer(delegate);
+
+  constexpr int64_t kRenderViewId = -1;
+  constexpr uint64_t kGeneration = 23;
+  rasterizer.SetDenialRenderOutputs({{
+      .render_view_id = kRenderViewId,
+      .configuration_generation = kGeneration,
+      .source_physical_bounds = DlRect::MakeWH(100, 100),
+      .target_size = DlISize(200, 200),
+      .scale_120 = 240,
+      .source_to_target_transform =
+          ProjectRect(DlRect::MakeWH(100, 100), DlISize(200, 200)),
+  }});
+
+  DisplayListBuilder wallpaper_builder;
+  wallpaper_builder.DrawRect(DlRect::MakeWH(100, 100), DlPaint());
+  auto wallpaper = std::make_shared<DisplayListLayer>(
+      DlPoint(), wallpaper_builder.Build(), false, false);
+  DisplayListBuilder cursor_builder;
+  cursor_builder.DrawRect(DlRect::MakeWH(10, 10), DlPaint());
+  auto cursor = cursor_builder.Build();
+  auto first_root = std::make_shared<ContainerLayer>();
+  first_root->Add(wallpaper);
+  first_root->Add(std::make_shared<DisplayListLayer>(DlPoint(10, 10), cursor,
+                                                     false, false));
+  auto first = RasterizerTestPeer::ExpandRenderOutputs(
+      rasterizer,
+      SingleLayerTreeList(
+          kImplicitViewId,
+          std::make_unique<LayerTree>(first_root, DlISize(100, 100)), 1.0f));
+  ASSERT_EQ(first.size(), 1u);
+
+  FrameDamage initial_damage;
+  initial_damage.SetExistingDamage(DlRegion());
+  initial_damage.ComputeDamageRegion(*first.front()->layer_tree, false, true);
+  RasterizerTestPeer::SetLastSuccessfulTask(rasterizer,
+                                            std::move(first.front()));
+
+  auto second_root = std::make_shared<ContainerLayer>();
+  second_root->Add(wallpaper);
+  second_root->Add(std::make_shared<DisplayListLayer>(DlPoint(30, 30), cursor,
+                                                      false, false));
+  auto second = RasterizerTestPeer::ExpandRenderOutputs(
+      rasterizer,
+      SingleLayerTreeList(
+          kImplicitViewId,
+          std::make_unique<LayerTree>(second_root, DlISize(100, 100)), 1.0f));
+  ASSERT_EQ(second.size(), 1u);
+
+  const LayerTreeTask* previous =
+      RasterizerTestPeer::LastSuccessfulTask(rasterizer, kRenderViewId);
+  ASSERT_NE(previous, nullptr);
+  FrameDamage moved_cursor_damage;
+  moved_cursor_damage.SetPreviousLayerTree(previous->layer_tree.get());
+  moved_cursor_damage.SetExistingDamage(DlRegion());
+  moved_cursor_damage.ComputeDamageRegion(*second.front()->layer_tree, false,
+                                          true);
+
+  ASSERT_TRUE(moved_cursor_damage.GetFrameDamage().has_value());
+  EXPECT_THAT(
+      moved_cursor_damage.GetFrameDamage()->getRects(),
+      ::testing::UnorderedElementsAre(DlIRect::MakeLTRB(20, 20, 40, 40),
+                                      DlIRect::MakeLTRB(60, 60, 80, 80)));
+}
+
+TEST(RasterizerTest, DenialRenderSelectionDefersOtherOutputs) {
+  NiceMock<MockDelegate> delegate;
+  Settings settings;
+  ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
+  Rasterizer rasterizer(delegate);
+  rasterizer.SetDenialRenderOutputs({
+      {
+          .render_view_id = -2,
+          .configuration_generation = 17,
+          .source_physical_bounds = DlRect::MakeXYWH(0, 0, 400, 600),
+          .target_size = DlISize(400, 600),
+          .scale_120 = 120,
+          .source_to_target_transform = DlMatrix(),
+      },
+      {
+          .render_view_id = -1,
+          .configuration_generation = 17,
+          .source_physical_bounds = DlRect::MakeXYWH(400, 0, 800, 600),
+          .target_size = DlISize(1200, 900),
+          .scale_120 = 180,
+          .source_to_target_transform = ProjectRect(
+              DlRect::MakeXYWH(400, 0, 800, 600), DlISize(1200, 900)),
+      },
+  });
+
+  rasterizer.PrepareDenialRenderOutputs({-2}, {});
+  auto source_root = std::make_shared<ContainerLayer>();
+  auto tasks = SingleLayerTreeList(
+      kImplicitViewId,
+      std::make_unique<LayerTree>(source_root, DlISize(1200, 600)), 1.0f);
+  auto selected =
+      RasterizerTestPeer::ExpandRenderOutputs(rasterizer, std::move(tasks));
+
+  ASSERT_EQ(selected.size(), 1u);
+  EXPECT_EQ(selected.front()->view_id, -2);
+  const auto* pending = RasterizerTestPeer::PendingRenderOutput(rasterizer, -1);
+  ASSERT_NE(pending, nullptr);
+  EXPECT_EQ(pending->layer_tree->frame_size(), DlISize(1200, 900));
+  auto* clip = static_cast<ClipRectLayer*>(pending->layer_tree->root_layer());
+  ASSERT_EQ(clip->layers().size(), 1u);
+  auto* transform = static_cast<TransformLayer*>(clip->layers().front().get());
+  ASSERT_EQ(transform->layers().size(), 1u);
+  auto* source_clip =
+      static_cast<ClipRectLayer*>(transform->layers().front().get());
+  ASSERT_EQ(source_clip->layers().size(), 1u);
+  EXPECT_EQ(source_clip->layers().front(), source_root);
+}
+
+TEST(RasterizerTest, DenialRenderOutputReplacementDropsTheOldGeneration) {
+  NiceMock<MockDelegate> delegate;
+  Settings settings;
+  ON_CALL(delegate, GetSettings()).WillByDefault(ReturnRef(settings));
+  Rasterizer rasterizer(delegate);
+  rasterizer.SetDenialRenderOutputs({{
+      .render_view_id = -4,
+      .configuration_generation = 11,
+      .source_physical_bounds = DlRect::MakeXYWH(0, 0, 640, 480),
+      .target_size = DlISize(640, 480),
+      .scale_120 = 120,
+      .source_to_target_transform = DlMatrix(),
+  }});
+  ASSERT_NE(RasterizerTestPeer::FindRenderOutput(rasterizer, -4), nullptr);
+
+  rasterizer.SetDenialRenderOutputs({{
+      .render_view_id = -9,
+      .configuration_generation = 12,
+      .source_physical_bounds = DlRect::MakeXYWH(0, 0, 1280, 720),
+      .target_size = DlISize(1920, 1080),
+      .scale_120 = 180,
+      .source_to_target_transform =
+          ProjectRect(DlRect::MakeXYWH(0, 0, 1280, 720), DlISize(1920, 1080)),
+  }});
+
+  EXPECT_EQ(RasterizerTestPeer::FindRenderOutput(rasterizer, -4), nullptr);
+  ASSERT_NE(RasterizerTestPeer::FindRenderOutput(rasterizer, -9), nullptr);
+  EXPECT_EQ(RasterizerTestPeer::ConfigurationGeneration(rasterizer), 12u);
 }
 
 TEST(RasterizerTest, isAiksContextInitialized) {

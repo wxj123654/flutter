@@ -5,6 +5,8 @@
 #include "impeller/display_list/image_filter.h"
 #include "impeller/display_list/dl_image_impeller.h"
 
+#include <optional>
+
 #include "flutter/display_list/effects/dl_color_sources.h"
 #include "flutter/display_list/effects/dl_image_filters.h"
 #include "fml/logging.h"
@@ -12,6 +14,7 @@
 #include "impeller/display_list/skia_conversions.h"
 #include "impeller/entity/contents/filters/color_filter_contents.h"
 #include "impeller/entity/contents/filters/filter_contents.h"
+#include "impeller/entity/contents/filters/glass_filter_contents.h"
 #include "impeller/entity/contents/filters/inputs/filter_input.h"
 #include "impeller/renderer/context.h"
 
@@ -33,8 +36,43 @@ std::shared_ptr<FilterContents> WrapInput(const ContentContext& renderer,
           Sigma(blur_filter->sigma_y()),                            //
           static_cast<Entity::TileMode>(blur_filter->tile_mode()),  //
           blur_filter->bounds(),                                    //
-          FilterContents::BlurStyle::kNormal                        //
+          FilterContents::BlurStyle::kNormal,                       //
+          nullptr,                                                  //
+          blur_filter->downsample_scale()                           //
       );
+    }
+    case flutter::DlImageFilterType::kGlass: {
+      const flutter::DlGlassImageFilter* glass_filter = filter->asGlass();
+      FML_DCHECK(glass_filter);
+      // Restrict work with the outer material's coverage hint, but keep the
+      // frost convolution unbounded. This is the same proven clamp path used
+      // by Denial's ordinary backdrop blur and preserves a valid blur halo for
+      // refraction at the shape edge.
+      FilterInput::Ref frost_input = input;
+      if (GlassFrostNeedsBlur(glass_filter->sigma_x(),
+                              glass_filter->sigma_y())) {
+        std::shared_ptr<FilterContents> frost =
+            FilterContents::MakeGaussianBlur(
+                input, Sigma(glass_filter->sigma_x()),
+                Sigma(glass_filter->sigma_y()), Entity::TileMode::kClamp,
+                std::nullopt, FilterContents::BlurStyle::kNormal, nullptr,
+                glass_filter->downsample_scale());
+        frost_input = FilterInput::Make(std::move(frost));
+      }
+      const flutter::DlColor tint = glass_filter->tint();
+      auto glass = std::make_shared<GlassFilterContents>(
+          glass_filter->shape(), glass_filter->thickness(),
+          glass_filter->refraction(), glass_filter->dispersion(),
+          glass_filter->saturation(),
+          Color(tint.getRedF(), tint.getGreenF(), tint.getBlueF(),
+                tint.getAlphaF()),
+          glass_filter->tint_strength(), glass_filter->brightness(),
+          glass_filter->light_angle(), glass_filter->light_intensity(),
+          glass_filter->edge_strength(), glass_filter->bevel_width_scale(),
+          glass_filter->refraction_depth_scale(), glass_filter->rim_width(),
+          glass_filter->rim_falloff(), glass_filter->opposite_light_strength());
+      glass->SetInputs({input, std::move(frost_input)});
+      return glass;
     }
     case flutter::DlImageFilterType::kDilate: {
       auto dilate_filter = filter->asDilate();

@@ -15,7 +15,8 @@ namespace flutter {
 GPUSurfaceGLImpeller::GPUSurfaceGLImpeller(
     GPUSurfaceGLDelegate* delegate,
     std::shared_ptr<impeller::Context> context,
-    bool render_to_surface)
+    bool render_to_surface,
+    bool fbo_zero_is_no_target)
     : weak_factory_(this) {
   if (delegate == nullptr) {
     return;
@@ -35,6 +36,7 @@ GPUSurfaceGLImpeller::GPUSurfaceGLImpeller(
   delegate_ = delegate;
   impeller_context_ = std::move(context);
   render_to_surface_ = render_to_surface;
+  fbo_zero_is_no_target_ = fbo_zero_is_no_target;
   aiks_context_ = std::move(aiks_context);
   is_valid_ = true;
 }
@@ -47,6 +49,42 @@ bool GPUSurfaceGLImpeller::IsValid() {
   return is_valid_;
 }
 
+bool GPUSurfaceGLImpeller::PresentFrame(
+    GPUSurfaceGLDelegate* delegate,
+    uint32_t fbo_id,
+    const DlISize& size,
+    const SurfaceFrame::SubmitInfo& submit_info) {
+  const std::optional<DlRegion> full_damage = DlRegion(DlIRect::MakeSize(size));
+  const std::optional<DlRegion>& frame_damage =
+      submit_info.frame_damage.has_value() ? submit_info.frame_damage
+                                           : full_damage;
+  const std::optional<DlRegion>& buffer_damage =
+      submit_info.buffer_damage.has_value() ? submit_info.buffer_damage
+                                            : full_damage;
+  delegate->GLContextSetDamageRegion(
+      buffer_damage ? std::make_optional(buffer_damage->bounds())
+                    : std::nullopt);
+  GLPresentInfo present_info = {
+      .fbo_id = fbo_id,
+      .frame_damage = frame_damage,
+      .presentation_time = submit_info.presentation_time,
+      .buffer_damage = buffer_damage,
+  };
+  return delegate->GLContextPresent(present_info);
+}
+
+DlMatrix GPUSurfaceGLImpeller::RootTransformation(
+    GPUSurfaceGLDelegate* delegate) {
+  return delegate->GLContextSurfaceTransformation();
+}
+
+void GPUSurfaceGLImpeller::ConfigureRootCanvas(DlCanvas* canvas,
+                                               GPUSurfaceGLDelegate* delegate) {
+  if (canvas) {
+    canvas->SetTransform(RootTransformation(delegate));
+  }
+}
+
 // |Surface|
 std::unique_ptr<SurfaceFrame> GPUSurfaceGLImpeller::AcquireFrame(
     const DlISize& size) {
@@ -54,22 +92,6 @@ std::unique_ptr<SurfaceFrame> GPUSurfaceGLImpeller::AcquireFrame(
     FML_LOG(ERROR) << "OpenGL surface was invalid.";
     return nullptr;
   }
-
-  auto swap_callback = [weak = weak_factory_.GetWeakPtr(),
-                        delegate = delegate_]() -> bool {
-    if (weak) {
-      GLPresentInfo present_info = {
-          .fbo_id = 0u,
-          .frame_damage = std::nullopt,
-          // TODO (https://github.com/flutter/flutter/issues/105597): wire-up
-          // presentation time to impeller backend.
-          .presentation_time = std::nullopt,
-          .buffer_damage = std::nullopt,
-      };
-      delegate->GLContextPresent(present_info);
-    }
-    return true;
-  };
 
   auto context_switch = delegate_->GLContextMakeCurrent();
   if (!context_switch->GetResult()) {
@@ -79,31 +101,75 @@ std::unique_ptr<SurfaceFrame> GPUSurfaceGLImpeller::AcquireFrame(
   }
 
   if (!render_to_surface_) {
+    auto submit = [weak = weak_factory_.GetWeakPtr(), delegate = delegate_,
+                   size, forward_damage = fbo_zero_is_no_target_](
+                      const SurfaceFrame& surface_frame) {
+      if (!forward_damage) {
+        return true;
+      }
+      return weak &&
+             PresentFrame(delegate, 0u, size, surface_frame.submit_info());
+    };
     return std::make_unique<SurfaceFrame>(
         nullptr, SurfaceFrame::FramebufferInfo{.supports_readback = true},
         [](const SurfaceFrame& surface_frame, DlCanvas* canvas) {
           return true;
         },
-        [](const SurfaceFrame& surface_frame) { return true; }, size);
+        std::move(submit), size);
   }
 
   GLFrameInfo frame_info = {static_cast<uint32_t>(size.width),
                             static_cast<uint32_t>(size.height)};
   const GLFBOInfo fbo_info = delegate_->GLContextFBO(frame_info);
+  auto framebuffer_info = delegate_->GLContextFramebufferInfo();
+  if (!framebuffer_info.existing_damage.has_value()) {
+    framebuffer_info.existing_damage = fbo_info.existing_damage;
+  }
+  auto present = [weak = weak_factory_.GetWeakPtr(), delegate = delegate_,
+                  size](uint32_t fbo_id,
+                        const SurfaceFrame& surface_frame) -> bool {
+    if (!weak) {
+      return false;
+    }
+    return PresentFrame(delegate, fbo_id, size, surface_frame.submit_info());
+  };
+  auto make_skipped_frame = [&](std::unique_ptr<GLContextResult> context) {
+    return std::make_unique<SurfaceFrame>(
+        nullptr, framebuffer_info,
+        [](SurfaceFrame&, DlCanvas*) { return true; },
+        [present](SurfaceFrame& surface_frame) {
+          return present(0u, surface_frame);
+        },
+        size, std::move(context), true);
+  };
+
+  if (fbo_info.fbo_id == 0u && fbo_zero_is_no_target_) {
+    return make_skipped_frame(std::move(context_switch));
+  }
+
+  auto swap_callback = []() -> bool { return true; };
   auto surface = impeller::SurfaceGLES::WrapFBO(
       impeller_context_,                         // context
       swap_callback,                             // swap_callback
       fbo_info.fbo_id,                           // fbo
       impeller::PixelFormat::kR8G8B8A8UNormInt,  // color_format
-      impeller::ISize{size.width, size.height}   // fbo_size
-  );
+      impeller::ISize{size.width, size.height},  // fbo_size
+      framebuffer_info.supports_readback);
+  if (!surface) {
+    FML_LOG(ERROR) << "Could not wrap Impeller OpenGL FBO " << fbo_info.fbo_id
+                   << ".";
+    if (fbo_zero_is_no_target_) {
+      return make_skipped_frame(std::move(context_switch));
+    }
+    return nullptr;
+  }
 
   impeller::RenderTarget render_target = surface->GetRenderTarget();
 
   SurfaceFrame::EncodeCallback encode_callback =
       [aiks_context = aiks_context_,  //
-       render_target](SurfaceFrame& surface_frame,
-                      DlCanvas* canvas) mutable -> bool {
+       render_target,
+       size](SurfaceFrame& surface_frame, DlCanvas* canvas) mutable -> bool {
     if (!aiks_context) {
       return false;
     }
@@ -114,6 +180,16 @@ std::unique_ptr<SurfaceFrame> GPUSurfaceGLImpeller::AcquireFrame(
       return false;
     }
 
+    const auto& buffer_damage = surface_frame.submit_info().buffer_damage;
+    const bool full_repaint =
+        !buffer_damage.has_value() ||
+        (!buffer_damage->isEmpty() && buffer_damage->isSimple() &&
+         buffer_damage->bounds() == DlIRect::MakeSize(size));
+    auto color0 = render_target.GetColorAttachment(0u);
+    color0.load_action = full_repaint ? impeller::LoadAction::kClear
+                                      : impeller::LoadAction::kLoad;
+    render_target.SetColorAttachment(color0, 0u);
+
     auto cull_rect =
         impeller::Rect::MakeSize(render_target.GetRenderTargetSize());
     return impeller::RenderToTarget(aiks_context->GetContentContext(),  //
@@ -122,27 +198,28 @@ std::unique_ptr<SurfaceFrame> GPUSurfaceGLImpeller::AcquireFrame(
                                     cull_rect,                          //
                                     /*reset_host_buffer=*/true          //
     );
-    return true;
   };
 
-  return std::make_unique<SurfaceFrame>(
-      nullptr,                                // surface
-      delegate_->GLContextFramebufferInfo(),  // framebuffer info
-      encode_callback,                        // encode callback
-      fml::MakeCopyable([surface = std::move(surface)](const SurfaceFrame&) {
-        return surface->Present();
-      }),                         // submit callback
+  auto frame = std::make_unique<SurfaceFrame>(
+      nullptr,           // surface
+      framebuffer_info,  // framebuffer info
+      encode_callback,   // encode callback
+      fml::MakeCopyable(
+          [surface = std::move(surface), present,
+           fbo_id = fbo_info.fbo_id](const SurfaceFrame& surface_frame) {
+            return surface->Present() && present(fbo_id, surface_frame);
+          }),                     // submit callback
       size,                       // frame size
       std::move(context_switch),  // context result
       true                        // display list fallback
   );
+  ConfigureRootCanvas(frame->Canvas(), delegate_);
+  return frame;
 }
 
 // |Surface|
 DlMatrix GPUSurfaceGLImpeller::GetRootTransformation() const {
-  // This backend does not currently support root surface transformations. Just
-  // return identity.
-  return {};
+  return RootTransformation(delegate_);
 }
 
 // |Surface|
