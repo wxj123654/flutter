@@ -71,11 +71,18 @@ class UnpackLinux extends Target {
         'ephemeral',
       ),
     );
+    // Denial ships libflutter_engine.so itself and has no GTK runner
+    // artifact. Skip that copy instead of failing the asset bundle.
+    final List<String> artifacts = _kLinuxArtifacts.where((String artifact) {
+      return environment.fileSystem
+          .file(environment.fileSystem.path.join(engineSourcePath, artifact))
+          .existsSync();
+    }).toList();
     final Depfile depfile = unpackDesktopArtifacts(
       fileSystem: environment.fileSystem,
       engineSourcePath: engineSourcePath,
       outputDirectory: outputDirectory,
-      artifacts: _kLinuxArtifacts,
+      artifacts: artifacts,
       clientSourcePaths: <String>[headersPath],
       icuDataPath: environment.artifacts.getArtifactPath(
         Artifact.icuData,
