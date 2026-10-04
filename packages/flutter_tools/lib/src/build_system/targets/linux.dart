@@ -78,12 +78,17 @@ class UnpackLinux extends Target {
           .file(environment.fileSystem.path.join(engineSourcePath, artifact))
           .existsSync();
     }).toList();
+    final List<String> clientSourcePaths = environment.fileSystem
+            .directory(headersPath)
+            .existsSync()
+        ? <String>[headersPath]
+        : <String>[];
     final Depfile depfile = unpackDesktopArtifacts(
       fileSystem: environment.fileSystem,
       engineSourcePath: engineSourcePath,
       outputDirectory: outputDirectory,
       artifacts: artifacts,
-      clientSourcePaths: <String>[headersPath],
+      clientSourcePaths: clientSourcePaths,
       icuDataPath: environment.artifacts.getArtifactPath(
         Artifact.icuData,
         platform: targetPlatform,
