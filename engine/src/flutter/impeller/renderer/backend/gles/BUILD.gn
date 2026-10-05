@@ -2,6 +2,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+import("//flutter/testing/testing.gni")
 import("//flutter/vulkan/config.gni")
 import("../../../tools/impeller.gni")
 
@@ -119,7 +120,7 @@ impeller_component("gles") {
   ]
 }
 
-# GL mock contracts only: no window, playground, or pixel readback.
+# Root contracts and headless EGL runtime-filter pixel regressions.
 impeller_component("denial_root_rendering_unittests") {
   target_type = "executable"
   testonly = true
@@ -135,4 +136,25 @@ impeller_component("denial_root_rendering_unittests") {
     "//flutter/testing:testing_lib",
     "//flutter/third_party/googletest:gtest_main",
   ]
+  if (is_linux) {
+    sources += [ "denial_runtime_filter_gles_unittests.cc" ]
+    deps += [
+      ":denial_runtime_filter_fixture",
+      ":denial_runtime_filter_fixture_location",
+      "//flutter/third_party/angle:includes",
+    ]
+  }
+}
+
+if (is_linux) {
+  impellerc("denial_runtime_filter_fixture") {
+    shaders =
+        [ "//flutter/impeller/fixtures/runtime_stage_filter_displacement.frag" ]
+    sl_file_extension = "iplr"
+    shader_target_flags = [ "--runtime-stage-gles" ]
+    iplr = true
+  }
+  fixtures_location("denial_runtime_filter_fixture_location") {
+    assets_dir = target_gen_dir
+  }
 }

@@ -70,12 +70,16 @@ std::optional<Entity> RuntimeEffectFilterContents::RenderFilter(
   if (input_snapshot->ShouldRasterizeForRuntimeEffects()) {
     Vector2 entity_offset =
         Vector2(entity.GetTransform().m[12], entity.GetTransform().m[13]);
+    // Runtime shaders can sample outside their output coverage (for example,
+    // displacement filters). Preserve the entire valid input when absorbing
+    // its transform and sampling origin, not just the output coverage hint.
+    const Rect& input_coverage = maybe_input_coverage.value();
     Matrix inverse = input_snapshot->transform.Invert();
     Quad quad = inverse.Transform(Quad{
-        coverage.GetLeftTop(),     //
-        coverage.GetRightTop(),    //
-        coverage.GetLeftBottom(),  //
-        coverage.GetRightBottom()  //
+        input_coverage.GetLeftTop(),     //
+        input_coverage.GetRightTop(),    //
+        input_coverage.GetLeftBottom(),  //
+        input_coverage.GetRightBottom()  //
     });
     TextureContents texture_contents;
     texture_contents.SetTexture(input_snapshot->texture);
@@ -83,7 +87,7 @@ std::optional<Entity> RuntimeEffectFilterContents::RenderFilter(
         Rect::MakePointBounds(quad.begin(), quad.end());
     if (bounds.has_value()) {
       texture_contents.SetSourceRect(bounds.value());
-      texture_contents.SetDestinationRect(coverage);
+      texture_contents.SetDestinationRect(input_coverage);
       texture_contents.SetStencilEnabled(false);
       texture_contents.SetSamplerDescriptor(input_snapshot->sampler_descriptor);
 
