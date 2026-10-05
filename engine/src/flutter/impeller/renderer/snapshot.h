@@ -49,6 +49,13 @@ struct Snapshot {
   /// performing the RuntimeEffect at the resolution of the screen, not the
   /// scaled up or scaled down version of the snapshot.
   bool ShouldRasterizeForRuntimeEffects() const {
+    // Runtime shaders receive only the input size and sampler, not the
+    // texture's sampling origin. Normalize borrowed GLES FBOs through
+    // TextureContents before binding them to the shader, even for an otherwise
+    // identity or translation-only snapshot.
+    if (texture && texture->GetYCoordScale() < 0.0f) {
+      return true;
+    }
     // If the transform has a rotation we don't re-rasterize because we'll lose
     // the rotation.
     // TODO(tbd): We should re-rasterize scaled and rotated snapshots.

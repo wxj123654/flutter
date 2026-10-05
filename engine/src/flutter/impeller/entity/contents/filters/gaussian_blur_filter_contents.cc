@@ -570,6 +570,12 @@ fml::StatusOr<RenderTarget> MakeGaussianBlurSubpass(
     const Quad& texture_uvs,
     std::string_view pass_label) {
   using VS = GaussianBlurVertexShader;
+  Quad sampling_uvs = texture_uvs;
+  if (input_texture->GetYCoordScale() < 0.0f) {
+    for (auto& uv : sampling_uvs) {
+      uv.y = 1.0f - uv.y;
+    }
+  }
   ContentContext::SubpassCallback subpass_callback =
       [&](const ContentContext& renderer, RenderPass& pass) {
         GaussianBlurVertexShader::FrameInfo frame_info;
@@ -591,10 +597,10 @@ fml::StatusOr<RenderTarget> MakeGaussianBlurSubpass(
             pass, data_host_buffer.EmplaceUniform(frag_info));
 
         std::array<VS::PerVertexData, 4> vertices = {
-            VS::PerVertexData{positions[0], texture_uvs[0]},
-            VS::PerVertexData{positions[1], texture_uvs[1]},
-            VS::PerVertexData{positions[2], texture_uvs[2]},
-            VS::PerVertexData{positions[3], texture_uvs[3]},
+            VS::PerVertexData{positions[0], sampling_uvs[0]},
+            VS::PerVertexData{positions[1], sampling_uvs[1]},
+            VS::PerVertexData{positions[2], sampling_uvs[2]},
+            VS::PerVertexData{positions[3], sampling_uvs[3]},
         };
         pass.SetVertexBuffer(CreateVertexBuffer(vertices, data_host_buffer));
 

@@ -11,6 +11,7 @@
 #include "impeller/renderer/backend/gles/test/mock_gles.h"
 #include "impeller/renderer/backend/gles/texture_gles.h"
 #include "impeller/renderer/shader_function.h"
+#include "impeller/renderer/snapshot.h"
 
 namespace impeller {
 namespace testing {
@@ -170,6 +171,25 @@ TEST_F(RootRenderingTest, OnlyBorrowedFramebufferTexturesNeedSamplingFlip) {
       TextureGLES::WrapTexture(context_->GetReactor(), desc, handle);
   ASSERT_TRUE(external);
   EXPECT_EQ(static_cast<const Texture&>(*external).GetYCoordScale(), 1.0f);
+}
+
+TEST_F(RootRenderingTest, RuntimeFiltersNormalizeBorrowedFramebufferInputs) {
+  auto output = MakeOutput(LoadAction::kClear);
+  Snapshot borrowed{.texture = output.GetRenderTargetTexture()};
+  EXPECT_TRUE(borrowed.ShouldRasterizeForRuntimeEffects());
+
+  const Context& context = *context_;
+  Snapshot owned{.texture = context.GetResourceAllocator()->CreateTexture(
+                     borrowed.texture->GetTextureDescriptor())};
+  ASSERT_TRUE(owned.texture);
+  EXPECT_FALSE(owned.ShouldRasterizeForRuntimeEffects());
+
+  // Translation alone is not a reason to rerasterize an owned input, but it
+  // must not hide the sampling-origin correction required by a borrowed FBO.
+  borrowed.transform = Matrix::MakeTranslation({12, 7, 0});
+  owned.transform = borrowed.transform;
+  EXPECT_TRUE(borrowed.ShouldRasterizeForRuntimeEffects());
+  EXPECT_FALSE(owned.ShouldRasterizeForRuntimeEffects());
 }
 
 }  // namespace testing
