@@ -472,7 +472,7 @@ deps = {
    Var('flutter_git') + '/third_party/freetype2' + '@' + 'be4bcb57914154fc1b9e2900bf8e4b516057e2b8',
 
   'engine/src/flutter/third_party/skia':
-   'https://github.com/denialwm/skia.git' + '@' + Var('skia_revision'),
+   'https://github.com/wxj123654/skia.git' + '@' + Var('skia_revision'),
 
   'engine/src/flutter/third_party/ocmock':
    Var('flutter_git') + '/third_party/ocmock' + '@' +  Var('ocmock_rev'),
